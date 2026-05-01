@@ -12,7 +12,7 @@
 
 ScoutTrace is a **local, open-source CLI and MCP proxy** that makes LLM tool-call observability trivial. It transparently wraps Model Context Protocol (MCP) servers — and, in later milestones, raw SDK tool calls — capturing structured metadata about each call (tool name, arguments, results, latency, errors) and forwarding the captured payloads to **any HTTP endpoint** the user configures.
 
-The default destination is **WebhookScout** (`https://api.webhookscout.com`), but ScoutTrace is **destination-agnostic**: users can point it at their own webhook, an internal observability sink, a local file, or `stdout`. ScoutTrace is privacy-first by default — capture is opt-in per field class, redaction is on by default, and **no network egress occurs without an explicit destination**.
+The default product destination is **WebhookScout** (<https://www.webhookscout.com>), while the CLI uses the WebhookScout API base URL for event delivery. ScoutTrace is **destination-agnostic**: users can point it at their own webhook, an internal observability sink, a local file, or `stdout`. ScoutTrace is privacy-first by default — capture is opt-in per field class, redaction is on by default, and **no network egress occurs without an explicit destination**.
 
 ScoutTrace is the *open* on-ramp to the WebhookScout ecosystem. It must be useful, trustworthy, and complete on its own.
 
@@ -98,7 +98,7 @@ flowchart TD
     C --> E[Choose destination]
     D --> E
     E --> F{Destination type?}
-    F -->|WebhookScout| G[Prompt for API key, setup token,<br/>or browser auto-provisioning<br/>API URL default: api.webhookscout.com]
+    F -->|WebhookScout| G[Prompt for API key, setup token,<br/>or browser auto-provisioning<br/>Product URL: www.webhookscout.com<br/>API base default: api.webhookscout.com]
     F -->|Custom HTTP| H[Prompt for URL + optional auth header]
     F -->|Local file| I[Prompt for path<br/>default: ~/.scouttrace/events.ndjson]
     F -->|stdout| J[No prompt]

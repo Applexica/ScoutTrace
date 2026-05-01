@@ -2,11 +2,19 @@
 
 A local, open-source CLI and MCP proxy that makes LLM tool-call observability trivial.
 
-ScoutTrace transparently wraps MCP servers, captures structured metadata about each tool call (with privacy-first redaction defaults), and forwards events to **any HTTP endpoint you configure**. The default destination is [WebhookScout](https://api.webhookscout.com), but ScoutTrace is destination-agnostic — point it at your own webhook, an internal sink, a local file, or `stdout`.
+ScoutTrace transparently wraps MCP servers, captures structured metadata about each tool call (with privacy-first redaction defaults), and forwards events to **any HTTP endpoint you configure**. The default destination is [WebhookScout](https://www.webhookscout.com), but ScoutTrace is destination-agnostic — point it at your own webhook, an internal sink, a local file, or `stdout`.
 
-> **Status:** Pre-alpha. The MVP CLI implementation exists in this repository; packaged installers and signed release binaries are still pending.
+> **Status:** Pre-alpha. The MVP CLI implementation exists in this repository and is installable from the Applexica Homebrew tap; signed standalone release binaries are still pending.
 
 ## Installation
+
+### Quick install
+
+```sh
+brew tap Applexica/tap
+brew install scouttrace
+scouttrace version
+```
 
 The recommended macOS/Linux install path is the Applexica Homebrew tap. Source installation remains available for development and for platforms where Homebrew is not preferred.
 
@@ -209,7 +217,7 @@ On Windows, rebuild `scouttrace.exe` and move it back to `%USERPROFILE%\bin`.
 
 ### Future package managers
 
-The following install paths are planned but not yet published:
+The following non-Homebrew install paths are planned but not yet published:
 
 ```sh
 winget install WebhookScout.ScoutTrace
