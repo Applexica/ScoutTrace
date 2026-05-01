@@ -28,6 +28,7 @@ See [§17 Security & Threat Model](./docs/PRD.md#17-security--threat-model) and 
 ## Documentation
 
 - [**Product Requirements Document**](./docs/PRD.md) — full spec: CLI taxonomy, config schema, payload schema, redaction policies, host-config patching, security model, MVP milestones, acceptance criteria, and testing strategy.
+- [**Technical Design Document**](./docs/TECHNICAL_DESIGN.md) — implementation-level companion to the PRD: package layout, process model, wire-protocol details, queue schema, host-patching algorithms, and step-by-step testing procedures.
 
 ## License
 

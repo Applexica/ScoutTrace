@@ -122,15 +122,83 @@ flowchart TD
 ### 6.3 Wizard rules
 
 - **Idempotent.** Re-running `init` detects existing config and offers `repair`, `migrate`, or `reconfigure` instead of clobbering.
-- **No network calls during wizard** unless the user picks WebhookScout and explicitly chooses either API-key validation, setup-token exchange, or agent auto-provisioning (separate confirmation).
+- **No network calls during wizard** unless the user picks WebhookScout and explicitly chooses either API-key validation, setup-token exchange, or browser/device auto-provisioning (separate confirmation).
 - **Editor invocation** uses `$EDITOR`, falling back to `nano`/`notepad`.
 - **All choices are flag-able**, so the wizard is fully scriptable: `scouttrace init --hosts claude-desktop,cursor --destination https://my.sink/in --profile strict --yes`.
+
+### 6.4 WebhookScout credential capture flow
+
+ScoutTrace must never require users to paste WebhookScout credentials into host MCP config files, project files, or `~/.scouttrace/config.yaml`. The wizard supports three WebhookScout credential paths and always ends with an opaque credential reference.
+
+#### Preferred path: portal setup token
+
+1. User clicks **Connect ScoutTrace** in the WebhookScout portal.
+2. Portal generates a short-lived setup command, for example:
+
+```sh
+scouttrace init --destination webhookscout --setup-token wst_abc123
+```
+
+3. ScoutTrace exchanges the setup token against the configured API URL.
+4. WebhookScout returns a scoped API key, an `agent_id`, and destination metadata.
+5. ScoutTrace stores the API key in the local credential provider and writes only `auth_header_ref` to YAML.
+
+#### Manual path: hidden API-key prompt
+
+If the user chooses **Paste API key now**, the wizard prompts with hidden input:
+
+```text
+WebhookScout API key: ********
+```
+
+ScoutTrace validates the key, creates or selects an agent/source, stores the key in the credential provider, and writes only the agent id plus key reference to config.
+
+#### Browser/device-code path
+
+If the user chooses **Open browser to create/connect agent**, ScoutTrace starts a device-style authorization flow:
+
+```text
+Opening browser to connect ScoutTrace…
+If the browser did not open, visit:
+https://www.webhookscout.com/app/scouttrace/connect
+
+Code: J7KQ-92LM
+Waiting for authorization...
+```
+
+After the user approves in the portal, the CLI polls the device-code endpoint, receives the scoped API key once, stores it locally, and proceeds with host patching.
+
+#### Credential storage rules
+
+Credential resolution order:
+
+1. Environment override: `SCOUTTRACE_WEBHOOKSCOUT_API_KEY`.
+2. OS credential store: macOS Keychain, Windows Credential Manager, or Linux Secret Service/libsecret.
+3. Encrypted local credential file: `~/.scouttrace/credentials.enc`, only after explicit user approval.
+4. Plaintext secrets in YAML are rejected by default. A development-only escape hatch such as `--allow-plaintext-secrets` must print a high-severity warning and must never be used by the wizard defaults.
+
+The resulting config looks like:
+
+```yaml
+destinations:
+  - name: default
+    type: webhookscout
+    api_url: https://api.webhookscout.com
+    agent_id: agent_abc123
+    auth_header_ref: keychain://scouttrace/webhookscout/default
+```
+
+Recommended WebhookScout scope model:
+
+- Setup key may create/read the agent: `mcp:agents:create`, `mcp:agents:read`.
+- Runtime proxy key should be narrowed to one agent and primarily needs `mcp:events:write`.
+- Optional diagnostics/status commands may request `mcp:stats:read`.
 
 ---
 
 ## 7. CLI Command Taxonomy
 
-All commands accept the global flags listed in §7.13.
+All commands accept the global flags listed in §7.16.
 
 ### 7.1 `scouttrace init`
 Interactive wizard (see §6).
@@ -166,7 +234,22 @@ scouttrace proxy -- <upstream-cmd> [upstream-args...]
 | `--max-arg-bytes` | int | 65536 | Truncate captured args above this size. |
 | `--max-result-bytes` | int | 262144 | Truncate captured results above this size. |
 
-### 7.3 `scouttrace run`
+### 7.3 `scouttrace start` / `scouttrace stop`
+Optional local dispatcher sidecar. MCP capture does **not** require users to run this: `scouttrace proxy` flushes the queue in-process when no sidecar is active. `start` exists for users who expect an explicit on/off command or want queued events delivered while no MCP host is currently running.
+
+```sh
+scouttrace start --foreground
+scouttrace stop
+```
+
+| Command | Description |
+|---|---|
+| `start --foreground` | Run dispatcher in the current terminal; recommended under launchd/systemd/Task Scheduler. |
+| `start --daemon` | Detach only after writing `~/.scouttrace/dispatch.pid` and acquiring `dispatch.lock`. |
+| `stop [--timeout 5s] [--force]` | Gracefully stop only the sidecar process; never kills in-proxy dispatchers owned by MCP hosts. |
+| `restart` | Equivalent to `stop && start`. |
+
+### 7.4 `scouttrace run`
 Execute a one-off command with proxying enabled. For SDK/post-MVP users.
 
 ```
@@ -175,13 +258,13 @@ scouttrace run -- python my_agent.py
 
 Sets `SCOUTTRACE_ENABLED=1` and (post-MVP) injects HTTP proxy env vars.
 
-### 7.4 `scouttrace status`
+### 7.5 `scouttrace status`
 Print health: queue depth, last successful upload, redaction profile, configured hosts, destination URL (auth headers redacted).
 
-### 7.5 `scouttrace doctor`
+### 7.6 `scouttrace doctor`
 Active diagnostics: launch each configured proxy, verify it can speak MCP `initialize` to its upstream, post a synthetic event to the destination, verify queue write/read.
 
-### 7.6 `scouttrace tail`
+### 7.7 `scouttrace tail`
 Stream events from the local queue (pre- or post-redaction) to stdout. Read-only; does not consume.
 
 | Flag | Default | Description |
@@ -190,7 +273,7 @@ Stream events from the local queue (pre- or post-redaction) to stdout. Read-only
 | `--format` | `pretty` | `pretty`, `json`, `ndjson`. |
 | `--filter` | none | jq-like filter expression. |
 
-### 7.7 `scouttrace replay`
+### 7.8 `scouttrace replay`
 Re-emit queued or archived events to a (possibly different) destination.
 
 ```
@@ -206,22 +289,45 @@ scouttrace replay --since 1h --to https://my.alt.sink/in
 | `--filter` | string | none | jq-like filter; only matching events are replayed. |
 | `--dry-run` | bool | false | List events that would be sent, with target, without delivering. |
 
-### 7.8 `scouttrace policy`
+### 7.9 `scouttrace policy`
 Subcommands: `show`, `edit`, `lint`, `test <event.json>`. Validates redaction policy YAML (see §13).
 
-### 7.9 `scouttrace hosts`
+### 7.10 `scouttrace preview`
+Runs a synthetic tool call through the configured capture + redaction + queue path **without delivering**. Used by the wizard and available directly as `scouttrace preview --server <name> [--profile strict] [--json]`.
+
+### 7.11 `scouttrace hosts`
 Subcommands: `list`, `detect`, `add`, `remove`, `patch`, `unpatch`, `diff`. Manages host config integrations.
 
-### 7.10 `scouttrace config`
+Common flags for `patch`, `unpatch`, and `diff`:
+
+| Flag | Description |
+|---|---|
+| `--host <id>` | Target one host integration. |
+| `--config-path <path>` | Test/advanced override for the host config file path. Not the same as global `--config`, which points to ScoutTrace's own config. |
+| `--servers <csv>` | Limit patching to selected MCP server names. |
+| `--force` | Proceed despite drift/conflict checks after warning. |
+
+### 7.12 `scouttrace config`
 Subcommands: `show`, `edit`, `set <key> <value>`, `validate`, `migrate`. Manages `~/.scouttrace/config.yaml`.
 
-### 7.11 `scouttrace queue`
-Subcommands: `stats`, `flush`, `purge`, `export`, `import`, `pause`, `resume`.
+### 7.13 `scouttrace queue`
+Subcommands: `stats`, `flush`, `purge`, `export`, `import`, `pause`, `resume`, `inject`. `scouttrace flush` is a top-level alias for `scouttrace queue flush`; `inject` is test/dev-only and hidden from normal help.
 
-### 7.12 `scouttrace undo`
+`queue flush` / `flush` flags:
+
+| Flag | Type | Description |
+|---|---|---|
+| `--destination <name>` | name | Flush events for a named destination from `config.yaml`. |
+| `--to <URL|file://...|stdout>` | ad hoc destination | Override the destination URL/type for this flush; unlike `--destination`, this is not a config name. |
+| `--yes` | bool | Confirm first-send approval in the same command when interactive policy allows it. |
+
+### 7.14 `scouttrace destination`
+Subcommands: `list`, `show <name>`, `approve <name>`, `approve-host <type> <host>`, `revoke-approval <name>`, `test <name>`. `approve <name>` records approval for the current `(destination name, type, resolved host)` tuple; if the destination's URL later changes, approval is required again. `approve-host` is an explicit advanced path for approving a host tuple. These commands are the non-interactive path required by AC-S2.
+
+### 7.15 `scouttrace undo`
 Restore the most recent backup of any patched host config. `scouttrace undo --list` shows available backups; `--all` reverts every change ScoutTrace has made.
 
-### 7.13 Global flags
+### 7.16 Global flags
 
 | Flag | Description |
 |---|---|
@@ -231,6 +337,8 @@ Restore the most recent backup of any patched host config. `scouttrace undo --li
 | `--json` | Machine-readable output for that command. |
 | `--no-color` | Disable ANSI colors. |
 | `--version` | Print version and exit. |
+| `--print-config` | For state-changing commands, print the effective config that would be used or written, with secrets redacted. |
+| `--diff` | For state-changing commands, print file/config diffs when applicable. |
 
 ---
 
@@ -248,7 +356,7 @@ destinations:
     type: webhookscout                  # webhookscout | http | file | stdout | plugin
     api_url: https://api.webhookscout.com
     agent_id: agent_8e0f...              # created by wizard or provided manually
-    auth_header_ref: keychain://scouttrace/default # opaque API-key ref, never raw secret
+    auth_header_ref: keychain://scouttrace/webhookscout/default # opaque API-key ref: keychain://scouttrace/<destination_type>/<destination_name>
     timeout_ms: 5000
     compression: gzip                   # none | gzip | zstd
     headers:
@@ -364,7 +472,7 @@ flowchart LR
 
 - **Wire goroutines/threads (2 per server):** read/write loops. Hot path; never block on capture.
 - **Capture queue:** lock-free ring buffer (bounded). Dropped events recorded as a counter (visible in `status`).
-- **Redaction worker pool:** `min(4, ncpu)` workers.
+- **Redaction worker pool:** `min(4, ncpu)` workers per active proxy process, fed by the capture worker through a bounded channel so redaction never blocks the wire path.
 - **Dispatcher:** single goroutine per destination, with `delivery.concurrency` parallel HTTP requests.
 
 ### 9.3 Failure isolation
