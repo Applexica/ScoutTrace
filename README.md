@@ -242,10 +242,15 @@ scouttrace init --hosts none --destination stdout --yes
 scouttrace doctor
 ```
 
-For WebhookScout, use the portal-generated setup token or your WebhookScout configuration once those provisioning endpoints are available:
+For WebhookScout today, use a WebhookScout API key plus the agent ID shown/created in the WebhookScout portal. The future setup-token flow will let the portal generate a short-lived token, but that WebhookScout portal endpoint is not live yet:
 
 ```sh
-scouttrace init --destination webhookscout --setup-token <portal-setup-token> --yes
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'
+scouttrace init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id <webhookscout-agent-id> \
+  --yes
 scouttrace doctor
 ```
 
@@ -301,7 +306,7 @@ scouttrace -v hosts list      # -v = verbose, -vv = more verbose
 
 ### WebhookScout examples for Claude Code, Codex, OpenClaw, Hermes, and Cursor
 
-The examples below show the same ScoutTrace command family for five common AI coding/agent environments. WebhookScout-specific examples use the `webhookscout` destination and store credentials through environment-variable or keychain-style references. Replace `<portal-setup-token>` with the short-lived token from the WebhookScout portal and replace `[REDACTED]` with your real key only in your local shell, never in committed files.
+The examples below show the same ScoutTrace command family for five common AI coding/agent environments. WebhookScout-specific examples use the `webhookscout` destination and store credentials through environment-variable or keychain-style references. Replace `[REDACTED]` with your real WebhookScout API key only in your local shell, never in committed files, and replace `<webhookscout-agent-id>` with the agent ID from the WebhookScout portal.
 
 > **Support note:** the current MVP has built-in JSON host patchers for `claude-code`, `claude-desktop`, and `cursor`. For Codex, OpenClaw, and Hermes, use `--hosts none` plus explicit `scouttrace proxy -- ...` wrapper commands unless that system documents a compatible MCP JSON config format.
 
@@ -309,38 +314,52 @@ Shared variables used by several examples:
 
 ```sh
 export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'
-export WEBHOOKSCOUT_SETUP_TOKEN='<portal-setup-token>'
+export WEBHOOKSCOUT_AGENT_ID='<webhookscout-agent-id>'
 ```
 
 #### `scouttrace init` with WebhookScout
 
-Create the local ScoutTrace config and point it at WebhookScout.
+Create the local ScoutTrace config and point it at WebhookScout. Today this requires a WebhookScout API key and agent ID. `WEBHOOKSCOUT_SETUP_TOKEN` is a planned future portal shortcut, not something you can get from the current WebhookScout portal.
 
 ```sh
 # Claude Code: built-in host id.
-scouttrace init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts claude-code --yes
-
-# Codex: initialize WebhookScout destination, then wrap Codex MCP servers manually with `proxy`.
-scouttrace --home ~/.scouttrace-codex init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts none --yes
-
-# OpenClaw: initialize a separate profile for OpenClaw/OpenCode-style MCP servers.
-scouttrace --home ~/.scouttrace-openclaw init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts none --yes
-
-# Hermes: initialize a Hermes-specific ScoutTrace home.
-scouttrace --home ~/.scouttrace-hermes init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts none --yes
-
-# Cursor: built-in host id.
-scouttrace init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts cursor --yes
-```
-
-If you already have a WebhookScout API key in an environment variable, use an auth-header reference instead of a setup token:
-
-```sh
 scouttrace init \
   --destination webhookscout \
   --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
-  --agent-id <webhookscout-agent-id> \
+  --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
   --hosts claude-code \
+  --yes
+
+# Codex: initialize WebhookScout destination, then wrap Codex MCP servers manually with `proxy`.
+scouttrace --home ~/.scouttrace-codex init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
+  --hosts none \
+  --yes
+
+# OpenClaw: initialize a separate profile for OpenClaw/OpenCode-style MCP servers.
+scouttrace --home ~/.scouttrace-openclaw init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
+  --hosts none \
+  --yes
+
+# Hermes: initialize a Hermes-specific ScoutTrace home.
+scouttrace --home ~/.scouttrace-hermes init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
+  --hosts none \
+  --yes
+
+# Cursor: built-in host id.
+scouttrace init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
+  --hosts cursor \
   --yes
 ```
 
@@ -696,27 +715,19 @@ Stdout setup that also patches Claude Desktop and Cursor:
 scouttrace init --hosts claude-desktop,cursor --destination stdout --yes
 ```
 
-WebhookScout setup with a portal-generated setup token (replace `<portal-setup-token>` with the value from your WebhookScout console):
+WebhookScout setup with an API key and agent ID from the WebhookScout portal:
 
 ```sh
-export SCOUTTRACE_ENCFILE_PASSPHRASE='choose-a-strong-passphrase'
-scouttrace init \
-  --destination webhookscout \
-  --setup-token <portal-setup-token> \
-  --hosts claude-desktop \
-  --yes
-```
-
-Once you have exchanged the setup token for an API key, re-run `init` (or hand-edit the auth-header reference) so the dispatcher has a usable credential:
-
-```sh
-export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'   # populate yourself; never commit
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'   # populate locally; never commit
 scouttrace init \
   --destination webhookscout \
   --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
   --agent-id <webhookscout-agent-id> \
-  --hosts none --yes
+  --hosts claude-desktop \
+  --yes
 ```
+
+The `--setup-token` flag is reserved for a planned future WebhookScout portal flow. Until that portal flow exists, do not use `WEBHOOKSCOUT_SETUP_TOKEN`; use `--auth-header-ref` plus `--agent-id` as shown above.
 
 Custom HTTP webhook with a credential reference:
 
@@ -727,7 +738,6 @@ scouttrace init \
   --auth-header-ref env://MY_WEBHOOK_TOKEN \
   --hosts none --yes
 ```
-
 Append-to-file destination:
 
 ```sh
