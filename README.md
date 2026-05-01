@@ -52,7 +52,7 @@ flowchart LR
    - **`file`** — append redacted envelopes to a local NDJSON file (`file:///path/events.ndjson`).
    - **`stdout`** — print envelopes to stdout. Useful for `--dry-run`-style flows and CI.
 
-> **Status:** Pre-alpha. The MVP CLI implementation exists in this repository and is installable from the Applexica Homebrew tap; signed standalone release binaries are still pending.
+> **Status:** Active open-source CLI. ScoutTrace is installable from the Applexica Homebrew tap; signed standalone release binaries are still pending.
 
 ## Installation
 
@@ -242,7 +242,7 @@ scouttrace init --hosts none --destination stdout --yes
 scouttrace doctor
 ```
 
-For WebhookScout today, use a WebhookScout API key plus the agent ID shown/created in the WebhookScout portal. The future setup-token flow will let the portal generate a short-lived token, but that WebhookScout portal endpoint is not live yet:
+For WebhookScout, use a WebhookScout API key plus the agent ID shown/created in the WebhookScout portal:
 
 ```sh
 export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'
@@ -290,7 +290,7 @@ scouttrace doctor
 
 ## How to use ScoutTrace
 
-This section is a hands-on tour of every command in the MVP CLI. Run `scouttrace <command> --help` for a flag reference; the examples below cover the realistic workflows.
+This section is a hands-on tour of every command in the ScoutTrace CLI. Run `scouttrace <command> --help` for a flag reference; the examples below cover the realistic workflows.
 
 ### Global flags
 
@@ -308,7 +308,7 @@ scouttrace -v hosts list      # -v = verbose, -vv = more verbose
 
 The examples below show the same ScoutTrace command family for five common AI coding/agent environments. WebhookScout-specific examples use the `webhookscout` destination and store credentials through environment-variable or keychain-style references. Replace `[REDACTED]` with your real WebhookScout API key only in your local shell, never in committed files, and replace `<webhookscout-agent-id>` with the agent ID from the WebhookScout portal.
 
-> **Support note:** the current MVP has built-in JSON host patchers for `claude-code`, `claude-desktop`, and `cursor`. For Codex, OpenClaw, and Hermes, use `--hosts none` plus explicit `scouttrace proxy -- ...` wrapper commands unless that system documents a compatible MCP JSON config format.
+> **Support note:** ScoutTrace has built-in JSON host patchers for `claude-code`, `claude-desktop`, and `cursor`. For Codex, OpenClaw, and Hermes, use `--hosts none` plus explicit `scouttrace proxy -- ...` wrapper commands unless that system documents a compatible MCP JSON config format.
 
 Shared variables used by several examples:
 
@@ -319,7 +319,7 @@ export WEBHOOKSCOUT_AGENT_ID='<webhookscout-agent-id>'
 
 #### `scouttrace init` with WebhookScout
 
-Create the local ScoutTrace config and point it at WebhookScout. Today this requires a WebhookScout API key and agent ID. `WEBHOOKSCOUT_SETUP_TOKEN` is a planned future portal shortcut, not something you can get from the current WebhookScout portal.
+Create the local ScoutTrace config and point it at WebhookScout. Use either a WebhookScout API key plus agent ID, or a short-lived setup token if your WebhookScout portal exposes one.
 
 ```sh
 # Claude Code: built-in host id.
@@ -373,15 +373,15 @@ scouttrace hosts list --json
 scouttrace hosts patch --host claude-code
 scouttrace hosts unpatch --host claude-code
 
-# Codex: no built-in host patcher in the MVP; confirm manually and use `proxy`.
+# Codex: no built-in host patcher yet; confirm manually and use `proxy`.
 scouttrace --home ~/.scouttrace-codex hosts list --json
 # Then configure Codex to launch: scouttrace --home ~/.scouttrace-codex proxy --server-name <server> -- <original-command>
 
-# OpenClaw: no built-in host patcher in the MVP; confirm manually and use `proxy`.
+# OpenClaw: no built-in host patcher yet; confirm manually and use `proxy`.
 scouttrace --home ~/.scouttrace-openclaw hosts list --json
 # Then configure OpenClaw to launch: scouttrace --home ~/.scouttrace-openclaw proxy --server-name <server> -- <original-command>
 
-# Hermes: no built-in host patcher in the MVP; confirm manually and use `proxy`.
+# Hermes: no built-in host patcher yet; confirm manually and use `proxy`.
 scouttrace --home ~/.scouttrace-hermes hosts list --json
 # Then configure Hermes to launch: scouttrace --home ~/.scouttrace-hermes proxy --server-name <server> -- <original-command>
 
@@ -701,7 +701,7 @@ scouttrace --home ~/.scouttrace version --json                 # Cursor
 
 ### `scouttrace init` — create a config
 
-`init` is the one-shot setup. The MVP build is non-interactive; pass `--yes`. Pick a destination and (optionally) the hosts to patch.
+`init` is the one-shot setup. Run `scouttrace init` for the interactive wizard, or pass `--yes` with flags for scripted/non-interactive setup. Pick a destination and (optionally) the hosts to patch.
 
 Local-only stdout setup, no host patching, no network egress:
 
@@ -727,7 +727,7 @@ scouttrace init \
   --yes
 ```
 
-The `--setup-token` flag is reserved for a planned future WebhookScout portal flow. Until that portal flow exists, do not use `WEBHOOKSCOUT_SETUP_TOKEN`; use `--auth-header-ref` plus `--agent-id` as shown above.
+If your WebhookScout portal provides a short-lived setup token, ScoutTrace can exchange it directly and store the returned scoped API key in the encrypted credential file. Set `SCOUTTRACE_ENCFILE_PASSPHRASE` first, then run `scouttrace init --destination webhookscout --setup-token <setup-token> --yes`.
 
 Custom HTTP webhook with a credential reference:
 
@@ -801,7 +801,7 @@ scouttrace proxy --fail-closed --server-name fs -- npx -y @modelcontextprotocol/
 
 ### `scouttrace run` — exec a child with ScoutTrace env vars
 
-A thin convenience for SDK shims (post-MVP) and tests. It sets `SCOUTTRACE_ENABLED=1` and a fresh `SCOUTTRACE_SESSION_ID` in the child's environment:
+A thin convenience for process instrumentation and tests. It sets `SCOUTTRACE_ENABLED=1` and a fresh `SCOUTTRACE_SESSION_ID` in the child's environment:
 
 ```sh
 scouttrace run -- python ./my-agent.py
@@ -887,7 +887,7 @@ scouttrace config set delivery.max_backoff_ms 120000
 scouttrace config set queue.path /var/lib/scouttrace/queue
 ```
 
-`config set` only accepts a vetted allow-list of keys in the MVP. For everything else, edit `~/.scouttrace/config.yaml` directly and run `scouttrace config validate`.
+`config set` accepts a vetted allow-list of safe keys. For everything else, edit `~/.scouttrace/config.yaml` directly and run `scouttrace config validate`.
 
 ### `scouttrace destination list|approve|approve-host`
 
@@ -1060,7 +1060,7 @@ See [§17 Security & Threat Model](./docs/PRD.md#17-security--threat-model) and 
 
 ## Documentation
 
-- [**Product Requirements Document**](./docs/PRD.md) — full spec: CLI taxonomy, config schema, payload schema, redaction policies, host-config patching, security model, MVP milestones, acceptance criteria, and testing strategy.
+- [**Product Requirements Document**](./docs/PRD.md) — full spec: CLI taxonomy, config schema, payload schema, redaction policies, host-config patching, security model, milestones, acceptance criteria, and testing strategy.
 - [**Technical Design Document**](./docs/TECHNICAL_DESIGN.md) — implementation-level companion to the PRD: package layout, process model, wire-protocol details, queue schema, host-patching algorithms, and step-by-step testing procedures.
 
 ## License

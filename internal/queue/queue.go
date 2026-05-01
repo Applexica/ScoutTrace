@@ -1,6 +1,6 @@
 // Package queue implements ScoutTrace's local durable event queue.
 //
-// The MVP build ships a file-backed queue: one record file per event with
+// ScoutTrace uses a durable file-backed queue: one record file per event with
 // metadata embedded as JSON header + gzipped payload body. Status is encoded
 // in the directory the file lives in (pending / inflight / dead) so that
 // transitions are atomic POSIX renames.

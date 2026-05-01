@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +22,210 @@ func runCLI(t *testing.T, home string, argv ...string) (int, string, string) {
 	stderr := &bytes.Buffer{}
 	exit := Run(full, strings.NewReader(""), stdout, stderr)
 	return exit, stdout.String(), stderr.String()
+}
+
+func runCLIWithInput(t *testing.T, home, input string, argv ...string) (int, string, string) {
+	t.Helper()
+	full := []string{"scouttrace", "--home", home}
+	full = append(full, argv...)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	exit := Run(full, strings.NewReader(input), stdout, stderr)
+	return exit, stdout.String(), stderr.String()
+}
+
+func TestInitInteractiveWizardStdout(t *testing.T) {
+	home := t.TempDir()
+	exit, stdout, stderr := runCLIWithInput(t, home, strings.Join([]string{
+		"stdout", // destination
+		"none",   // hosts
+		"strict", // redaction profile
+		"y",      // write config
+	}, "\n")+"\n", "init")
+	if exit != 0 {
+		t.Fatalf("interactive init exit = %d\nstdout: %s\nstderr: %s", exit, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "ScoutTrace setup wizard") || !strings.Contains(stdout, "Wrote") {
+		t.Fatalf("wizard output missing expected text:\n%s", stdout)
+	}
+	exit, out, stderr := runCLI(t, home, "config", "show", "--json")
+	if exit != 0 {
+		t.Fatalf("config show exit = %d stderr=%s", exit, stderr)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(out), &cfg); err != nil {
+		t.Fatalf("config not JSON: %v\n%s", err, out)
+	}
+	dests := cfg["destinations"].([]any)
+	first := dests[0].(map[string]any)
+	if first["type"] != "stdout" {
+		t.Fatalf("destination type = %v, want stdout\nconfig: %s", first["type"], out)
+	}
+}
+
+func TestInitInteractiveWizardWebhookScoutUsesEnvCredentialRef(t *testing.T) {
+	home := t.TempDir()
+	exit, stdout, stderr := runCLIWithInput(t, home, strings.Join([]string{
+		"webhookscout",                          // destination
+		"https://api.webhookscout.test",         // API base
+		"agent_test_123",                        // agent id
+		"env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY", // credential reference
+		"claude-code,cursor",                    // hosts
+		"standard",                              // redaction profile
+		"y",                                     // write config
+	}, "\n")+"\n", "init")
+	if exit != 0 {
+		t.Fatalf("interactive WebhookScout init exit = %d\nstdout: %s\nstderr: %s", exit, stdout, stderr)
+	}
+	if strings.Contains(stdout+stderr, "interactive wizard not implemented") {
+		t.Fatalf("saw old MVP error:\nstdout: %s\nstderr: %s", stdout, stderr)
+	}
+	exit, out, stderr := runCLI(t, home, "config", "show", "--json")
+	if exit != 0 {
+		t.Fatalf("config show exit = %d stderr=%s", exit, stderr)
+	}
+	if !strings.Contains(out, `"type": "webhookscout"`) ||
+		!strings.Contains(out, `"api_base": "https://api.webhookscout.test"`) ||
+		!strings.Contains(out, `"agent_id": "agent_test_123"`) ||
+		!strings.Contains(out, `"auth_header_ref": "env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY"`) {
+		t.Fatalf("config missing WebhookScout wizard fields:\n%s", out)
+	}
+}
+
+func TestInitInteractiveEmptyStdinDoesNotWriteConfig(t *testing.T) {
+	home := t.TempDir()
+	exit, stdout, stderr := runCLIWithInput(t, home, "", "init")
+	if exit == 0 {
+		t.Fatalf("expected non-zero exit for empty non-interactive stdin; stdout=%s stderr=%s", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "interactive input unavailable") {
+		t.Fatalf("stderr missing non-interactive guidance: %s", stderr)
+	}
+	if _, err := os.Stat(filepath.Join(home, "config.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("config should not be written on empty stdin; stat err=%v", err)
+	}
+}
+
+func TestInitSetupTokenDryRunDoesNotExchangeOrWriteCredentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		t.Fatalf("setup token exchange should not be called during dry-run")
+	}))
+	defer srv.Close()
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--dry-run", "--destination", "webhookscout", "--api-base", srv.URL, "--setup-token", "setup_test_secret", "--hosts", "none")
+	if exit != 0 {
+		t.Fatalf("dry-run setup-token init exit = %d\nstdout: %s\nstderr: %s", exit, stdout, stderr)
+	}
+	if called {
+		t.Fatalf("setup token endpoint was called during dry-run")
+	}
+	if _, err := os.Stat(filepath.Join(home, "credentials.enc")); !os.IsNotExist(err) {
+		t.Fatalf("credentials should not be written during dry-run; stat err=%v", err)
+	}
+	if strings.Contains(stdout+stderr, "setup_test_secret") {
+		t.Fatalf("setup token leaked during dry-run\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+}
+
+func TestInitSetupTokenExchangeErrorDoesNotLeakResponseBody(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "token setup_test_secret produced api key whs_secret", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "webhookscout", "--api-base", srv.URL, "--setup-token", "setup_test_secret", "--hosts", "none")
+	if exit == 0 {
+		t.Fatalf("expected exchange failure")
+	}
+	if strings.Contains(stdout+stderr, "setup_test_secret") || strings.Contains(stdout+stderr, "whs_secret") {
+		t.Fatalf("exchange failure leaked secret\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "HTTP 400") {
+		t.Fatalf("stderr missing sanitized HTTP status: %s", stderr)
+	}
+}
+
+func TestInitSetupTokenRejectsPlainHTTPNonLocalhost(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	for _, apiBase := range []string{"http://api.example.com", "http://127.evil.com", "http://127.0.0.1.evil.com"} {
+		exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "webhookscout", "--api-base", apiBase, "--setup-token", "setup_test_secret", "--hosts", "none")
+		if exit == 0 {
+			t.Fatalf("expected plain HTTP api base rejection for %s\nstdout:%s\nstderr:%s", apiBase, stdout, stderr)
+		}
+		if !strings.Contains(stderr, "https") {
+			t.Fatalf("stderr missing https guidance for %s: %s", apiBase, stderr)
+		}
+	}
+}
+
+func TestInitSetupTokenRejectsRedirects(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	targetCalled := false
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetCalled = true
+		http.Error(w, "should not receive setup token", http.StatusTeapot)
+	}))
+	defer target.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/capture", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "webhookscout", "--api-base", redirector.URL, "--setup-token", "setup_test_secret", "--hosts", "none")
+	if exit == 0 {
+		t.Fatalf("expected redirect rejection\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	if targetCalled {
+		t.Fatalf("redirect target received setup token request")
+	}
+	if strings.Contains(stdout+stderr, "setup_test_secret") {
+		t.Fatalf("setup token leaked in redirect failure\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+}
+
+func TestInitSetupTokenExchangesAndStoresAPIKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	var gotToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/setup-tokens/exchange" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		gotToken = body["token"]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"agent_id":"agent_from_setup","api_key":"whs_test_secret","scopes":["mcp:write"]}`))
+	}))
+	defer srv.Close()
+
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "webhookscout", "--api-base", srv.URL, "--setup-token", "setup_test_secret", "--agent-name", "local", "--hosts", "none")
+	if exit != 0 {
+		t.Fatalf("init setup-token exit = %d\nstdout: %s\nstderr: %s", exit, stdout, stderr)
+	}
+	if gotToken != "setup_test_secret" {
+		t.Fatalf("setup exchange token = %q", gotToken)
+	}
+	if strings.Contains(stdout+stderr, "setup_test_secret") || strings.Contains(stdout+stderr, "whs_test_secret") {
+		t.Fatalf("secret leaked in output\nstdout: %s\nstderr: %s", stdout, stderr)
+	}
+	exit, out, stderr := runCLI(t, home, "config", "show", "--json")
+	if exit != 0 {
+		t.Fatalf("config show exit=%d stderr=%s", exit, stderr)
+	}
+	if !strings.Contains(out, `"agent_id": "agent_from_setup"`) || !strings.Contains(out, `"auth_header_ref": "encfile://default-api-key"`) {
+		t.Fatalf("setup exchange config missing fields:\n%s", out)
+	}
+	if strings.Contains(out, "whs_test_secret") || strings.Contains(out, "setup_test_secret") {
+		t.Fatalf("secret leaked in config:\n%s", out)
+	}
 }
 
 func TestRootHelpListsCommands(t *testing.T) {

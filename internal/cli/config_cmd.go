@@ -187,7 +187,7 @@ func setConfigPath(c *config.Config, key, value string) error {
 	case "queue.path":
 		c.Queue.Path = value
 	default:
-		return fmt.Errorf("config: key %q is not settable via `config set` in MVP", key)
+		return fmt.Errorf("config: key %q is not settable via `config set`; edit the config file and run `scouttrace config validate`", key)
 	}
 	return nil
 }

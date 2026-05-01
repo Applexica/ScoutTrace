@@ -75,7 +75,7 @@ func commandByName(name string) (Command, bool) {
 
 func allCommands() []Command {
 	return []Command{
-		{Name: "init", Summary: "set up ScoutTrace (non-interactive with --yes)", Run: CmdInit},
+		{Name: "init", Summary: "set up ScoutTrace with an interactive wizard or --yes flags", Run: CmdInit},
 		{Name: "proxy", Summary: "stdio proxy: wraps an MCP server", Run: CmdProxy},
 		{Name: "run", Summary: "exec a child with SCOUTTRACE_ENABLED=1", Run: CmdRun},
 		{Name: "status", Summary: "show queue + dispatcher status", Run: CmdStatus},

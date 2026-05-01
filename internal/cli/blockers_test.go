@@ -212,22 +212,37 @@ func TestInitWebhookScoutSynthesizesAgentID(t *testing.T) {
 	}
 }
 
-func TestInitSetupTokenNotPromotedToAuthRef(t *testing.T) {
+func TestInitSetupTokenExchangedNotPromotedToAuthRef(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "another-passphrase-here")
-	exit, _, stderr := runCLI(t, home, "init", "--yes",
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/setup-tokens/exchange" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"agent_id":"agent_setup_blocker","api_key":"whs_setup_secret"}`))
+	}))
+	defer srv.Close()
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes",
 		"--destination", "webhookscout",
+		"--api-base", srv.URL,
 		"--setup-token", "wst_test_abcdef1234567890",
 	)
 	if exit != 0 {
-		t.Fatalf("init exit = %d; stderr: %s", exit, stderr)
+		t.Fatalf("init exit = %d; stdout: %s stderr: %s", exit, stdout, stderr)
 	}
 	cfgBytes, _ := os.ReadFile(filepath.Join(home, "config.yaml"))
 	cfg := string(cfgBytes)
 	if strings.Contains(cfg, "encfile://default-setup-token") {
 		t.Errorf("setup-token must not be auth_header_ref:\n%s", cfg)
 	}
-	if strings.Contains(cfg, "wst_test_abcdef1234567890") {
-		t.Errorf("plaintext setup-token in config:\n%s", cfg)
+	if !strings.Contains(cfg, "encfile://default-api-key") {
+		t.Errorf("exchanged api key auth ref missing:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "agent_setup_blocker") {
+		t.Errorf("exchanged agent id missing:\n%s", cfg)
+	}
+	if strings.Contains(cfg+stdout+stderr, "wst_test_abcdef1234567890") || strings.Contains(cfg+stdout+stderr, "whs_setup_secret") {
+		t.Errorf("setup token or exchanged api key leaked\nconfig:%s\nstdout:%s\nstderr:%s", cfg, stdout, stderr)
 	}
 }

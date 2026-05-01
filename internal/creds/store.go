@@ -1,9 +1,9 @@
 // Package creds resolves credential refs into secret material with a
 // well-defined precedence order: env > keychain > encfile.
 //
-// The MVP build ships:
+// ScoutTrace ships:
 //   - EnvStore  (always available)
-//   - EncFileStore (NaCl-style not in stdlib, so the MVP uses a
+//   - EncFileStore (NaCl-style not in stdlib, so this build uses a
 //     scrypt+AES-GCM scheme keyed by a passphrase)
 //   - KeychainStore (stub that returns ErrUnavailable on this platform)
 //

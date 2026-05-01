@@ -1,12 +1,20 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/webhookscout/scouttrace/internal/config"
 	"github.com/webhookscout/scouttrace/internal/creds"
@@ -14,10 +22,8 @@ import (
 	"github.com/webhookscout/scouttrace/internal/hosts"
 )
 
-// CmdInit creates a fresh config + ScoutTrace home dir. The MVP build is
-// strictly non-interactive: callers must pass --yes, --destination,
-// --type, and either --url/--path or rely on stdout type. The wizard
-// described in PRD §6 is post-MVP and lives behind --interactive (TODO).
+// CmdInit creates a fresh config + ScoutTrace home dir. With --yes it runs
+// non-interactively from flags; without --yes it starts the setup wizard.
 func CmdInit(ctx context.Context, g *Globals, args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(g.Stderr)
@@ -44,10 +50,16 @@ func CmdInit(ctx context.Context, g *Globals, args []string) int {
 	}
 	apply()
 	if !*yes {
-		fmt.Fprintln(g.Stderr, "scouttrace init: interactive wizard not implemented in MVP. Re-run with --yes.")
-		return 64
+		if ok := runInitWizard(g, initWizardPointers{
+			destName: destName, destType: destType, destURL: destURL,
+			destination: destination, destPath: destPath, apiBase: apiBase,
+			agentID: agentID, agentName: agentName, authRef: authRef,
+			profile: profile, hostsFlag: hostsFlag, dryRun: dryRun,
+		}); !ok {
+			return 1
+		}
 	}
-	_ = agentName // surfaced via webhookscout adapter post-MVP
+	_ = agentName // reserved for future WebhookScout display metadata
 	if *apiURL != "" {
 		*apiBase = *apiURL
 	}
@@ -79,21 +91,47 @@ func CmdInit(ctx context.Context, g *Globals, args []string) int {
 		}
 	}
 
-	// Secure secret handling: tokens are never written to config in
-	// plaintext. We stash them in the encrypted-file store when a
-	// passphrase is available; otherwise we record an env-ref the user
-	// can populate later.
-	//
-	// IMPORTANT: a setup token is NOT a usable Authorization header — it
-	// must be exchanged for an api_key first. We persist it for the
-	// post-MVP exchange flow but never set auth_header_ref to point at it.
-	if *setupToken != "" {
-		if err := stashSecret(g, "default-setup-token", *setupToken); err != nil {
-			fmt.Fprintf(g.Stderr, "init: setup token not stashed: %v\n", err)
-			fmt.Fprintln(g.Stderr, "init: run with SCOUTTRACE_ENCFILE_PASSPHRASE set, or pass --api-key once you exchange the token.")
-		} else {
-			fmt.Fprintln(g.Stdout, "init: setup token stashed (encfile://default-setup-token). Exchange via the WebhookScout console; then re-run init with --api-key.")
+	// Dry-runs must not consume one-time setup tokens or write credentials.
+	// Populate safe placeholder refs so config validation and JSON plan output
+	// still show what would be written after a real exchange.
+	if *dryRun && *setupToken != "" {
+		if *agentID == "" {
+			*agentID = "agent_pending_setup_token_exchange"
 		}
+		if *authRef == "" {
+			*authRef = "encfile://default-api-key"
+		}
+		*setupToken = ""
+	}
+
+	// Setup tokens are exchanged immediately for a scoped WebhookScout API
+	// key, then the token and key are wiped from command state. The generated
+	// key must be stored in the encrypted credential store; otherwise the
+	// one-time setup flow would leave the user with an unusable config.
+	if *setupToken != "" {
+		if os.Getenv("SCOUTTRACE_ENCFILE_PASSPHRASE") == "" {
+			fmt.Fprintln(g.Stderr, "init: setup token exchange needs secure local storage before the one-time token is consumed.")
+			fmt.Fprintln(g.Stderr, "init: export SCOUTTRACE_ENCFILE_PASSPHRASE and re-run, or use --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY with a manually exported key.")
+			return 1
+		}
+		exchangedAgentID, exchangedAPIKey, err := exchangeWebhookScoutSetupToken(ctx, *apiBase, *setupToken, *agentName)
+		if err != nil {
+			fmt.Fprintf(g.Stderr, "init: setup token exchange failed: %v\n", err)
+			return 1
+		}
+		if exchangedAgentID != "" {
+			*agentID = exchangedAgentID
+		}
+		ref, err := stashOrEnvRef(g, "default-api-key", exchangedAPIKey, "SCOUTTRACE_WEBHOOKSCOUT_API_KEY")
+		if err != nil {
+			fmt.Fprintf(g.Stderr, "init: exchanged API key could not be stored securely: %v\n", err)
+			fmt.Fprintln(g.Stderr, "init: set SCOUTTRACE_ENCFILE_PASSPHRASE and re-run setup token exchange, or use --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY with a manually exported key.")
+			return 1
+		}
+		if *authRef == "" {
+			*authRef = ref
+		}
+		fmt.Fprintf(g.Stdout, "init: setup token exchanged; WebhookScout API key stored as %s\n", ref)
 		*setupToken = ""
 	}
 	if *apiKey != "" {
@@ -175,6 +213,221 @@ func CmdInit(ctx context.Context, g *Globals, args []string) int {
 		}
 	}
 	return 0
+}
+
+type initWizardPointers struct {
+	destName    *string
+	destType    *string
+	destURL     *string
+	destination *string
+	destPath    *string
+	apiBase     *string
+	agentID     *string
+	agentName   *string
+	authRef     *string
+	profile     *string
+	hostsFlag   *string
+	dryRun      *bool
+}
+
+func runInitWizard(g *Globals, p initWizardPointers) bool {
+	pr := &wizardPrompter{w: g.Stdout, r: bufio.NewReader(g.Stdin)}
+	fmt.Fprintln(g.Stdout, "ScoutTrace setup wizard")
+	fmt.Fprintln(g.Stdout, "This will create a local ScoutTrace config. Secrets are referenced through env://, keychain://, or encfile:// refs and are not written directly to config.")
+	fmt.Fprintln(g.Stdout)
+
+	choice := normalizeDestination(pr.ask("Destination (webhookscout, stdout, file, http)", "stdout"))
+	if pr.sawEOF {
+		fmt.Fprintln(g.Stderr, "init: interactive input unavailable. Re-run with --yes for scripted setup or run in an interactive terminal.")
+		return false
+	}
+	*p.destination = ""
+	*p.destType = choice
+	switch choice {
+	case "webhookscout":
+		*p.apiBase = pr.ask("WebhookScout API base", defaultString(*p.apiBase, "https://api.webhookscout.com"))
+		*p.agentID = pr.ask("WebhookScout agent ID", *p.agentID)
+		if *p.agentID == "" {
+			fmt.Fprintln(g.Stderr, "init: WebhookScout agent ID is required. Create/select an agent in the WebhookScout portal, then run init again.")
+			return false
+		}
+		*p.authRef = pr.ask("Credential reference", defaultString(*p.authRef, "env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY"))
+	case "stdout":
+		// No additional destination fields.
+	case "file":
+		*p.destPath = pr.ask("NDJSON output file", defaultString(*p.destPath, "./scouttrace-events.ndjson"))
+	case "http":
+		*p.destURL = pr.ask("HTTP destination URL", *p.destURL)
+		if *p.destURL == "" {
+			fmt.Fprintln(g.Stderr, "init: HTTP destination URL is required")
+			return false
+		}
+		*p.authRef = pr.ask("Credential reference (blank for none)", *p.authRef)
+	default:
+		fmt.Fprintf(g.Stderr, "init: unsupported destination %q\n", choice)
+		return false
+	}
+	*p.hostsFlag = pr.ask("Hosts to patch (comma-separated claude-desktop,claude-code,cursor or none)", defaultString(*p.hostsFlag, "none"))
+	*p.profile = pr.ask("Redaction profile (strict, standard, permissive)", defaultString(*p.profile, "strict"))
+	if pr.sawEOF {
+		fmt.Fprintln(g.Stderr, "init: interactive input ended before confirmation; no files written. Re-run with --yes for scripted setup.")
+		return false
+	}
+	if *p.destName == "" {
+		*p.destName = "default"
+	}
+	fmt.Fprintln(g.Stdout)
+	fmt.Fprintf(g.Stdout, "Plan: destination=%s name=%s hosts=%s redaction=%s config=%s\n", *p.destType, *p.destName, *p.hostsFlag, *p.profile, g.ConfigPath)
+	if !yesish(pr.ask("Write this configuration?", "y")) || pr.sawEOF {
+		fmt.Fprintln(g.Stdout, "Init cancelled; no files written.")
+		return false
+	}
+	return true
+}
+
+type wizardPrompter struct {
+	w      io.Writer
+	r      *bufio.Reader
+	sawEOF bool
+}
+
+func (p *wizardPrompter) ask(prompt, def string) string {
+	if def != "" {
+		fmt.Fprintf(p.w, "%s [%s]: ", prompt, def)
+	} else {
+		fmt.Fprintf(p.w, "%s: ", prompt)
+	}
+	line, err := p.r.ReadString('\n')
+	if err == io.EOF {
+		p.sawEOF = true
+	} else if err != nil {
+		p.sawEOF = true
+		return def
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return def
+	}
+	return line
+}
+
+func askWizard(w io.Writer, r *bufio.Reader, prompt, def string) string {
+	if def != "" {
+		fmt.Fprintf(w, "%s [%s]: ", prompt, def)
+	} else {
+		fmt.Fprintf(w, "%s: ", prompt)
+	}
+	line, err := r.ReadString('\n')
+	line = strings.TrimSpace(line)
+	if err != nil && err != io.EOF {
+		return def
+	}
+	if line == "" {
+		return def
+	}
+	return line
+}
+
+func normalizeDestination(in string) string {
+	s := strings.ToLower(strings.TrimSpace(in))
+	switch s {
+	case "", "1", "stdout", "local", "local-only":
+		return "stdout"
+	case "2", "webhookscout", "webhook", "whs":
+		return "webhookscout"
+	case "3", "file":
+		return "file"
+	case "4", "http", "https":
+		return "http"
+	default:
+		return s
+	}
+}
+
+func defaultString(v, def string) string {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
+}
+
+func yesish(v string) bool {
+	s := strings.ToLower(strings.TrimSpace(v))
+	return s == "" || s == "y" || s == "yes" || s == "true" || s == "1"
+}
+
+type setupTokenExchangeResponse struct {
+	AgentID string   `json:"agent_id"`
+	APIKey  string   `json:"api_key"`
+	Scopes  []string `json:"scopes,omitempty"`
+}
+
+func exchangeWebhookScoutSetupToken(ctx context.Context, apiBase, token, agentName string) (string, string, error) {
+	apiBase = strings.TrimRight(strings.TrimSpace(apiBase), "/")
+	if apiBase == "" {
+		return "", "", fmt.Errorf("api base required")
+	}
+	parsed, err := url.Parse(apiBase)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", "", fmt.Errorf("valid api base URL required")
+	}
+	if parsed.Scheme != "https" && !isLocalHTTPHost(parsed.Hostname()) {
+		return "", "", fmt.Errorf("setup token exchange requires https api base; plain http is allowed only for localhost development")
+	}
+	if strings.TrimSpace(token) == "" {
+		return "", "", fmt.Errorf("setup token required")
+	}
+	body := map[string]string{"token": token}
+	if strings.TrimSpace(agentName) != "" {
+		body["agent_name"] = agentName
+	}
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return "", "", err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiBase+"/v1/setup-tokens/exchange", bytes.NewReader(buf))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ScoutTrace")
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+		return "", "", fmt.Errorf("exchange endpoint returned HTTP %d", resp.StatusCode)
+	}
+	var out setupTokenExchangeResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+		return "", "", fmt.Errorf("decode exchange response: %w", err)
+	}
+	if out.AgentID == "" {
+		return "", "", fmt.Errorf("exchange response missing agent_id")
+	}
+	if out.APIKey == "" {
+		return "", "", fmt.Errorf("exchange response missing api_key")
+	}
+	return out.AgentID, out.APIKey, nil
+}
+
+func isLocalHTTPHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "localhost" {
+		return true
+	}
+	addr, err := netip.ParseAddr(h)
+	return err == nil && addr.IsLoopback()
 }
 
 // stashSecret writes a secret into the encrypted-file store when the user

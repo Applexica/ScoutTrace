@@ -11,7 +11,7 @@ import (
 )
 
 // CmdRun execs a child process with SCOUTTRACE_ENABLED=1 and a session id
-// in the environment so SDK shims (post-MVP) can observe it. The MVP
+// in the environment so SDK shims and child processes can observe it. This
 // build is a thin convenience wrapper; it does not intercept the child's
 // stdio.
 func CmdRun(ctx context.Context, g *Globals, args []string) int {
