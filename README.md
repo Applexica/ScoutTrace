@@ -8,7 +8,26 @@ ScoutTrace transparently wraps MCP servers, captures structured metadata about e
 
 ## Installation
 
-ScoutTrace is currently installed from source. The commands below build the `scouttrace` binary locally from this repository and put it on your `PATH`.
+The recommended macOS/Linux install path is the Applexica Homebrew tap. Source installation remains available for development and for platforms where Homebrew is not preferred.
+
+### Homebrew tap (macOS and Linux)
+
+```sh
+brew tap Applexica/tap
+brew install scouttrace
+scouttrace version
+```
+
+To upgrade later:
+
+```sh
+brew update
+brew upgrade scouttrace
+```
+
+### Source install
+
+The commands below build the `scouttrace` binary locally from this repository and put it on your `PATH`.
 
 ### Prerequisites
 
@@ -22,7 +41,7 @@ Verify Go is available:
 go version
 ```
 
-### macOS
+#### macOS
 
 Install prerequisites with Homebrew if needed:
 
@@ -55,7 +74,7 @@ scouttrace version
 scouttrace --help
 ```
 
-### Linux
+#### Linux
 
 Install prerequisites. Debian/Ubuntu:
 
@@ -101,7 +120,7 @@ scouttrace version
 scouttrace --help
 ```
 
-### Windows
+#### Windows
 
 Install prerequisites:
 
@@ -147,7 +166,7 @@ scouttrace version
 scouttrace --help
 ```
 
-### Build without installing
+#### Build without installing
 
 If you only want to try ScoutTrace from a checkout:
 
@@ -193,12 +212,11 @@ On Windows, rebuild `scouttrace.exe` and move it back to `%USERPROFILE%\bin`.
 The following install paths are planned but not yet published:
 
 ```sh
-brew install scouttrace
 winget install WebhookScout.ScoutTrace
 scoop install scouttrace
 ```
 
-Until those packages exist, use the source installation steps above.
+Until those packages exist, use Homebrew or the source installation steps above.
 
 ## Quick start
 
@@ -226,4 +244,4 @@ See [§17 Security & Threat Model](./docs/PRD.md#17-security--threat-model) and 
 
 ## License
 
-Apache-2.0 (intended).
+Apache-2.0. See [LICENSE](./LICENSE).
