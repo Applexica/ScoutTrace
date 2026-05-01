@@ -2,13 +2,13 @@
 
 A local, open-source CLI and MCP proxy that makes LLM tool-call observability trivial.
 
-ScoutTrace sits between an MCP host (Claude Desktop, Claude Code, Cursor, Windsurf, Continue, Hermes, …) and the MCP servers it spawns. It byte-tees the JSON-RPC traffic so the host and server see exactly the bytes they would have seen without ScoutTrace, while a parallel capture pipeline builds a structured `ToolCallEvent` for every `tools/call` round-trip. Each event records *what* tool was invoked, *which* server handled it, *who* answered (success/error), and *how long* it took — never the raw conversation, and never anything that hasn't passed through redaction.
+ScoutTrace sits between an MCP host (Claude Code, Codex, OpenClaw, Hermes, Cursor, Claude Desktop, or any other MCP-capable client) and the MCP servers it spawns. It byte-tees the JSON-RPC traffic so the host and server see exactly the bytes they would have seen without ScoutTrace, while a parallel capture pipeline builds a structured `ToolCallEvent` for every `tools/call` round-trip. Each event records *what* tool was invoked, *which* server handled it, *who* answered (success/error), and *how long* it took — never the raw conversation, and never anything that hasn't passed through redaction.
 
 Captured events are written to a local on-disk queue, then dispatched to **any HTTP endpoint you configure**. The default destination is [WebhookScout](https://www.webhookscout.com), but ScoutTrace is destination-agnostic — point it at your own webhook, an internal sink, a local file, or `stdout`.
 
 ### What ScoutTrace gives you
 
-- **Drop-in MCP proxy.** `scouttrace hosts patch` rewrites the host's MCP config so each server runs under `scouttrace proxy -- <upstream>`. Hosts and servers do not need to know ScoutTrace exists.
+- **Drop-in MCP proxy.** For built-in supported hosts, `scouttrace hosts patch` rewrites the MCP config so each server runs under `scouttrace proxy -- <upstream>`. For other MCP clients, manually configure the same proxy wrapper. Hosts and servers do not need to know ScoutTrace exists.
 - **Structured `ToolCallEvent` envelopes.** Stable schema covering session, host, server, tool, request/response, timing, and the exact redaction policy hash applied.
 - **Privacy-first redaction.** A `strict | standard | permissive` profile strips well-known secret patterns and PII, normalizes paths, and truncates oversized payloads *before* anything leaves the local process. Capture-level deny rules can drop fields entirely so they never enter the envelope.
 - **Durable local queue.** A simple file-system queue (`pending/` → `inflight/` → `dead/`) survives crashes and restarts. The dispatcher claims rows atomically and applies exponential backoff with jitter on transient failures.
@@ -281,7 +281,7 @@ scouttrace init --hosts none --destination stdout --yes
 scouttrace doctor
 ```
 
-`scouttrace init` creates `~/.scouttrace/config.yaml`. Host patching can then be enabled with `scouttrace hosts patch` for supported MCP hosts (Claude Desktop, Claude Code, Cursor, Windsurf, Continue, Hermes). You can preview what will be captured before any network egress with `scouttrace preview --json`.
+`scouttrace init` creates `~/.scouttrace/config.yaml`. Built-in host patching can then be enabled with `scouttrace hosts patch` for supported JSON MCP hosts (`claude-desktop`, `claude-code`, and `cursor`). For Codex, OpenClaw, Hermes, Windsurf, Continue, or other MCP clients, use the manual `scouttrace proxy -- ...` wrapper examples below unless that host exposes a compatible config file you have reviewed. You can preview what will be captured before any network egress with `scouttrace preview --json`.
 
 ## How to use ScoutTrace
 
@@ -298,6 +298,387 @@ scouttrace -v hosts list      # -v = verbose, -vv = more verbose
 ```
 
 `SCOUTTRACE_HOME` and `SCOUTTRACE_CONFIG` work as environment-variable equivalents of `--home` / `--config`.
+
+### WebhookScout examples for Claude Code, Codex, OpenClaw, Hermes, and Cursor
+
+The examples below show the same ScoutTrace command family for five common AI coding/agent environments. WebhookScout-specific examples use the `webhookscout` destination and store credentials through environment-variable or keychain-style references. Replace `<portal-setup-token>` with the short-lived token from the WebhookScout portal and replace `[REDACTED]` with your real key only in your local shell, never in committed files.
+
+> **Support note:** the current MVP has built-in JSON host patchers for `claude-code`, `claude-desktop`, and `cursor`. For Codex, OpenClaw, and Hermes, use `--hosts none` plus explicit `scouttrace proxy -- ...` wrapper commands unless that system documents a compatible MCP JSON config format.
+
+Shared variables used by several examples:
+
+```sh
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'
+export WEBHOOKSCOUT_SETUP_TOKEN='<portal-setup-token>'
+```
+
+#### `scouttrace init` with WebhookScout
+
+Create the local ScoutTrace config and point it at WebhookScout.
+
+```sh
+# Claude Code: built-in host id.
+scouttrace init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts claude-code --yes
+
+# Codex: initialize WebhookScout destination, then wrap Codex MCP servers manually with `proxy`.
+scouttrace --home ~/.scouttrace-codex init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts none --yes
+
+# OpenClaw: initialize a separate profile for OpenClaw/OpenCode-style MCP servers.
+scouttrace --home ~/.scouttrace-openclaw init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts none --yes
+
+# Hermes: initialize a Hermes-specific ScoutTrace home.
+scouttrace --home ~/.scouttrace-hermes init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts none --yes
+
+# Cursor: built-in host id.
+scouttrace init --destination webhookscout --setup-token "$WEBHOOKSCOUT_SETUP_TOKEN" --hosts cursor --yes
+```
+
+If you already have a WebhookScout API key in an environment variable, use an auth-header reference instead of a setup token:
+
+```sh
+scouttrace init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id <webhookscout-agent-id> \
+  --hosts claude-code \
+  --yes
+```
+
+#### `scouttrace hosts list|patch|unpatch` with WebhookScout
+
+Use this when the AI system stores MCP servers in a JSON config file ScoutTrace can patch. Built-in host IDs work directly. For systems without a built-in patcher, list support status here and configure `scouttrace proxy -- ...` manually in that system instead.
+
+```sh
+# Claude Code.
+scouttrace hosts list --json
+scouttrace hosts patch --host claude-code
+scouttrace hosts unpatch --host claude-code
+
+# Codex: no built-in host patcher in the MVP; confirm manually and use `proxy`.
+scouttrace --home ~/.scouttrace-codex hosts list --json
+# Then configure Codex to launch: scouttrace --home ~/.scouttrace-codex proxy --server-name <server> -- <original-command>
+
+# OpenClaw: no built-in host patcher in the MVP; confirm manually and use `proxy`.
+scouttrace --home ~/.scouttrace-openclaw hosts list --json
+# Then configure OpenClaw to launch: scouttrace --home ~/.scouttrace-openclaw proxy --server-name <server> -- <original-command>
+
+# Hermes: no built-in host patcher in the MVP; confirm manually and use `proxy`.
+scouttrace --home ~/.scouttrace-hermes hosts list --json
+# Then configure Hermes to launch: scouttrace --home ~/.scouttrace-hermes proxy --server-name <server> -- <original-command>
+
+# Cursor.
+scouttrace hosts list --json
+scouttrace hosts patch --host cursor
+scouttrace hosts unpatch --host cursor
+```
+
+#### `scouttrace proxy` with WebhookScout
+
+Use this when you want to manually wrap a single MCP server command for a specific AI environment. The proxy reads the active WebhookScout destination from the selected `--home` / config.
+
+```sh
+# Claude Code MCP server wrapper.
+scouttrace --home ~/.scouttrace proxy --server-name claude-code-github -- npx -y @modelcontextprotocol/server-github
+
+# Codex MCP server wrapper.
+scouttrace --home ~/.scouttrace-codex proxy --server-name codex-filesystem -- npx -y @modelcontextprotocol/server-filesystem "$PWD"
+
+# OpenClaw MCP server wrapper.
+scouttrace --home ~/.scouttrace-openclaw proxy --server-name openclaw-github -- npx -y @modelcontextprotocol/server-github
+
+# Hermes MCP server wrapper.
+scouttrace --home ~/.scouttrace-hermes proxy --server-name hermes-filesystem -- npx -y @modelcontextprotocol/server-filesystem "$PWD"
+
+# Cursor MCP server wrapper.
+scouttrace --home ~/.scouttrace proxy --server-name cursor-github -- npx -y @modelcontextprotocol/server-github
+```
+
+#### `scouttrace run` with WebhookScout
+
+Use `run` for custom agent processes or SDK instrumentation shims. It sets ScoutTrace environment variables for the child process; the WebhookScout destination still comes from the selected ScoutTrace config.
+
+```sh
+# Claude Code-adjacent local script.
+scouttrace --home ~/.scouttrace run -- python ./agents/claude_code_agent.py
+
+# Codex local automation.
+scouttrace --home ~/.scouttrace-codex run -- python ./agents/codex_agent.py
+
+# OpenClaw local automation.
+scouttrace --home ~/.scouttrace-openclaw run -- node ./agents/openclaw-agent.mjs
+
+# Hermes local automation.
+scouttrace --home ~/.scouttrace-hermes run -- python ./agents/hermes_agent.py
+
+# Cursor local automation.
+scouttrace --home ~/.scouttrace run -- node ./agents/cursor-agent.mjs
+```
+
+#### `scouttrace start|stop|restart` with WebhookScout
+
+Start a dispatcher sidecar for each AI system profile when you want queued WebhookScout events to drain even while the host is closed.
+
+```sh
+# Claude Code.
+scouttrace --home ~/.scouttrace start --yes
+scouttrace --home ~/.scouttrace stop
+scouttrace --home ~/.scouttrace restart
+
+# Codex.
+scouttrace --home ~/.scouttrace-codex start --yes
+scouttrace --home ~/.scouttrace-codex stop
+scouttrace --home ~/.scouttrace-codex restart
+
+# OpenClaw.
+scouttrace --home ~/.scouttrace-openclaw start --yes
+scouttrace --home ~/.scouttrace-openclaw stop
+scouttrace --home ~/.scouttrace-openclaw restart
+
+# Hermes.
+scouttrace --home ~/.scouttrace-hermes start --yes
+scouttrace --home ~/.scouttrace-hermes stop
+scouttrace --home ~/.scouttrace-hermes restart
+
+# Cursor.
+scouttrace --home ~/.scouttrace start --yes
+scouttrace --home ~/.scouttrace stop
+scouttrace --home ~/.scouttrace restart
+```
+
+#### `scouttrace status` with WebhookScout
+
+Check queue health and destination count per AI system profile.
+
+```sh
+scouttrace --home ~/.scouttrace status --json                 # Claude Code
+scouttrace --home ~/.scouttrace-codex status --json           # Codex
+scouttrace --home ~/.scouttrace-openclaw status --json        # OpenClaw
+scouttrace --home ~/.scouttrace-hermes status --json          # Hermes
+scouttrace --home ~/.scouttrace status --json                 # Cursor if sharing default home
+```
+
+#### `scouttrace doctor` with WebhookScout
+
+Validate WebhookScout destination configuration without sending a live event.
+
+```sh
+scouttrace --home ~/.scouttrace doctor --json                 # Claude Code
+scouttrace --home ~/.scouttrace-codex doctor --json           # Codex
+scouttrace --home ~/.scouttrace-openclaw doctor --json        # OpenClaw
+scouttrace --home ~/.scouttrace-hermes doctor --json          # Hermes
+scouttrace --home ~/.scouttrace doctor --json                 # Cursor if sharing default home
+```
+
+#### `scouttrace preview` with WebhookScout
+
+Preview how WebhookScout-bound events will be redacted for each AI system profile.
+
+```sh
+scouttrace --home ~/.scouttrace preview --profile strict --json --with-meta          # Claude Code
+scouttrace --home ~/.scouttrace-codex preview --profile strict --json --with-meta    # Codex
+scouttrace --home ~/.scouttrace-openclaw preview --profile strict --json --with-meta # OpenClaw
+scouttrace --home ~/.scouttrace-hermes preview --profile strict --json --with-meta   # Hermes
+scouttrace --home ~/.scouttrace preview --profile strict --json --with-meta          # Cursor
+```
+
+#### `scouttrace config show|validate|get|set` with WebhookScout
+
+Inspect or update WebhookScout config for each profile. These commands are local-only; they do not send events.
+
+```sh
+# Claude Code.
+scouttrace --home ~/.scouttrace config show --json
+scouttrace --home ~/.scouttrace config get destinations
+scouttrace --home ~/.scouttrace config set redaction.profile strict
+scouttrace --home ~/.scouttrace config validate
+
+# Codex.
+scouttrace --home ~/.scouttrace-codex config show --json
+scouttrace --home ~/.scouttrace-codex config get destinations
+scouttrace --home ~/.scouttrace-codex config set redaction.profile strict
+scouttrace --home ~/.scouttrace-codex config validate
+
+# OpenClaw.
+scouttrace --home ~/.scouttrace-openclaw config show --json
+scouttrace --home ~/.scouttrace-openclaw config get destinations
+scouttrace --home ~/.scouttrace-openclaw config set redaction.profile strict
+scouttrace --home ~/.scouttrace-openclaw config validate
+
+# Hermes.
+scouttrace --home ~/.scouttrace-hermes config show --json
+scouttrace --home ~/.scouttrace-hermes config get destinations
+scouttrace --home ~/.scouttrace-hermes config set redaction.profile strict
+scouttrace --home ~/.scouttrace-hermes config validate
+
+# Cursor.
+scouttrace --home ~/.scouttrace config show --json
+scouttrace --home ~/.scouttrace config get destinations
+scouttrace --home ~/.scouttrace config set redaction.profile strict
+scouttrace --home ~/.scouttrace config validate
+```
+
+#### `scouttrace destination list|approve|approve-host` with WebhookScout
+
+Approve the WebhookScout API host for each AI system profile before the first network send.
+
+```sh
+# Claude Code.
+scouttrace --home ~/.scouttrace destination list
+scouttrace --home ~/.scouttrace destination approve default
+scouttrace --home ~/.scouttrace destination approve-host webhookscout api.webhookscout.com
+
+# Codex.
+scouttrace --home ~/.scouttrace-codex destination list
+scouttrace --home ~/.scouttrace-codex destination approve default
+scouttrace --home ~/.scouttrace-codex destination approve-host webhookscout api.webhookscout.com
+
+# OpenClaw.
+scouttrace --home ~/.scouttrace-openclaw destination list
+scouttrace --home ~/.scouttrace-openclaw destination approve default
+scouttrace --home ~/.scouttrace-openclaw destination approve-host webhookscout api.webhookscout.com
+
+# Hermes.
+scouttrace --home ~/.scouttrace-hermes destination list
+scouttrace --home ~/.scouttrace-hermes destination approve default
+scouttrace --home ~/.scouttrace-hermes destination approve-host webhookscout api.webhookscout.com
+
+# Cursor.
+scouttrace --home ~/.scouttrace destination list
+scouttrace --home ~/.scouttrace destination approve default
+scouttrace --home ~/.scouttrace destination approve-host webhookscout api.webhookscout.com
+```
+
+#### `scouttrace queue stats|list|inject|flush|prune` with WebhookScout
+
+Queue commands are the fastest way to test that a WebhookScout-bound event can be created, inspected, and flushed.
+
+```sh
+# Claude Code.
+scouttrace --home ~/.scouttrace queue stats --json
+scouttrace --home ~/.scouttrace preview --json | scouttrace --home ~/.scouttrace queue inject --destination default
+scouttrace --home ~/.scouttrace queue list --destination default --limit 5
+scouttrace --home ~/.scouttrace queue flush --destination default --yes
+scouttrace --home ~/.scouttrace queue prune --max-age-days 7
+
+# Codex.
+scouttrace --home ~/.scouttrace-codex queue stats --json
+scouttrace --home ~/.scouttrace-codex preview --json | scouttrace --home ~/.scouttrace-codex queue inject --destination default
+scouttrace --home ~/.scouttrace-codex queue list --destination default --limit 5
+scouttrace --home ~/.scouttrace-codex queue flush --destination default --yes
+scouttrace --home ~/.scouttrace-codex queue prune --max-age-days 7
+
+# OpenClaw.
+scouttrace --home ~/.scouttrace-openclaw queue stats --json
+scouttrace --home ~/.scouttrace-openclaw preview --json | scouttrace --home ~/.scouttrace-openclaw queue inject --destination default
+scouttrace --home ~/.scouttrace-openclaw queue list --destination default --limit 5
+scouttrace --home ~/.scouttrace-openclaw queue flush --destination default --yes
+scouttrace --home ~/.scouttrace-openclaw queue prune --max-age-days 7
+
+# Hermes.
+scouttrace --home ~/.scouttrace-hermes queue stats --json
+scouttrace --home ~/.scouttrace-hermes preview --json | scouttrace --home ~/.scouttrace-hermes queue inject --destination default
+scouttrace --home ~/.scouttrace-hermes queue list --destination default --limit 5
+scouttrace --home ~/.scouttrace-hermes queue flush --destination default --yes
+scouttrace --home ~/.scouttrace-hermes queue prune --max-age-days 7
+
+# Cursor.
+scouttrace --home ~/.scouttrace queue stats --json
+scouttrace --home ~/.scouttrace preview --json | scouttrace --home ~/.scouttrace queue inject --destination default
+scouttrace --home ~/.scouttrace queue list --destination default --limit 5
+scouttrace --home ~/.scouttrace queue flush --destination default --yes
+scouttrace --home ~/.scouttrace queue prune --max-age-days 7
+```
+
+#### `scouttrace flush` with WebhookScout
+
+`flush` is a top-level alias for `queue flush`; use it when you only want one delivery pass.
+
+```sh
+scouttrace --home ~/.scouttrace flush --destination default --yes                 # Claude Code
+scouttrace --home ~/.scouttrace-codex flush --destination default --yes           # Codex
+scouttrace --home ~/.scouttrace-openclaw flush --destination default --yes        # OpenClaw
+scouttrace --home ~/.scouttrace-hermes flush --destination default --yes          # Hermes
+scouttrace --home ~/.scouttrace flush --destination default --yes                 # Cursor
+```
+
+#### `scouttrace tail` with WebhookScout
+
+Tail the local redacted event queue before or after WebhookScout delivery.
+
+```sh
+scouttrace --home ~/.scouttrace tail --once --destination default --format pretty          # Claude Code
+scouttrace --home ~/.scouttrace-codex tail --once --destination default --format pretty    # Codex
+scouttrace --home ~/.scouttrace-openclaw tail --once --destination default --format pretty # OpenClaw
+scouttrace --home ~/.scouttrace-hermes tail --once --destination default --format pretty   # Hermes
+scouttrace --home ~/.scouttrace tail --once --destination default --format pretty          # Cursor
+```
+
+#### `scouttrace replay` with WebhookScout
+
+Replay an NDJSON export into each profile's WebhookScout destination.
+
+```sh
+scouttrace --home ~/.scouttrace replay --from ./webhookscout-events.ndjson --destination default          # Claude Code
+scouttrace --home ~/.scouttrace-codex replay --from ./webhookscout-events.ndjson --destination default    # Codex
+scouttrace --home ~/.scouttrace-openclaw replay --from ./webhookscout-events.ndjson --destination default # OpenClaw
+scouttrace --home ~/.scouttrace-hermes replay --from ./webhookscout-events.ndjson --destination default   # Hermes
+scouttrace --home ~/.scouttrace replay --from ./webhookscout-events.ndjson --destination default          # Cursor
+```
+
+#### `scouttrace policy show|lint|test` with WebhookScout
+
+Use the same redaction policy commands for every AI system; they verify what WebhookScout will receive.
+
+```sh
+# Claude Code.
+scouttrace --home ~/.scouttrace policy show --profile strict --json
+scouttrace --home ~/.scouttrace preview --json | scouttrace --home ~/.scouttrace policy test --profile strict
+scouttrace --home ~/.scouttrace policy lint --path ./policies/custom.json
+
+# Codex.
+scouttrace --home ~/.scouttrace-codex policy show --profile strict --json
+scouttrace --home ~/.scouttrace-codex preview --json | scouttrace --home ~/.scouttrace-codex policy test --profile strict
+scouttrace --home ~/.scouttrace-codex policy lint --path ./policies/custom.json
+
+# OpenClaw.
+scouttrace --home ~/.scouttrace-openclaw policy show --profile strict --json
+scouttrace --home ~/.scouttrace-openclaw preview --json | scouttrace --home ~/.scouttrace-openclaw policy test --profile strict
+scouttrace --home ~/.scouttrace-openclaw policy lint --path ./policies/custom.json
+
+# Hermes.
+scouttrace --home ~/.scouttrace-hermes policy show --profile strict --json
+scouttrace --home ~/.scouttrace-hermes preview --json | scouttrace --home ~/.scouttrace-hermes policy test --profile strict
+scouttrace --home ~/.scouttrace-hermes policy lint --path ./policies/custom.json
+
+# Cursor.
+scouttrace --home ~/.scouttrace policy show --profile strict --json
+scouttrace --home ~/.scouttrace preview --json | scouttrace --home ~/.scouttrace policy test --profile strict
+scouttrace --home ~/.scouttrace policy lint --path ./policies/custom.json
+```
+
+#### `scouttrace undo` with WebhookScout host patches
+
+Undo only applies where ScoutTrace patched an MCP host config.
+
+```sh
+scouttrace undo --host claude-code                         # Claude Code
+# Codex: not applicable unless you manually used a compatible host patcher; remove manual proxy entries from Codex config instead.
+# OpenClaw: not applicable unless you manually used a compatible host patcher; remove manual proxy entries from OpenClaw config instead.
+# Hermes: not applicable unless you manually used a compatible host patcher; remove manual proxy entries from Hermes config instead.
+scouttrace undo --host cursor                              # Cursor
+```
+
+#### `scouttrace version` with WebhookScout installs
+
+Use the same version command everywhere to confirm the binary Homebrew installed is the one you expect.
+
+```sh
+scouttrace --home ~/.scouttrace version --json                 # Claude Code
+scouttrace --home ~/.scouttrace-codex version --json           # Codex
+scouttrace --home ~/.scouttrace-openclaw version --json        # OpenClaw
+scouttrace --home ~/.scouttrace-hermes version --json          # Hermes
+scouttrace --home ~/.scouttrace version --json                 # Cursor
+```
 
 ### `scouttrace init` — create a config
 
@@ -333,6 +714,7 @@ export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'   # populate yourself; never
 scouttrace init \
   --destination webhookscout \
   --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id <webhookscout-agent-id> \
   --hosts none --yes
 ```
 
