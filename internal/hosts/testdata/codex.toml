@@ -1,0 +1,17 @@
+# Codex CLI configuration
+model = "gpt-5"
+sandbox_mode = "workspace-write"
+
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/code"]
+
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[mcp_servers.github.env]
+GITHUB_TOKEN = "ghp_secret_value_should_never_be_copied"
+
+[other_section]
+key = "unrelated"

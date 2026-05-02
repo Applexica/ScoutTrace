@@ -357,7 +357,7 @@ scouttrace init --hosts none --destination stdout --yes
 scouttrace doctor
 ```
 
-`scouttrace init` creates `~/.scouttrace/config.yaml`. Built-in host patching can then be enabled with `scouttrace hosts patch` for supported JSON MCP hosts (`claude-desktop`, `claude-code`, and `cursor`). For Codex, OpenClaw, Hermes, Windsurf, Continue, or other MCP clients, use the manual `scouttrace proxy -- ...` wrapper examples below unless that host exposes a compatible config file you have reviewed. You can preview what will be captured before any network egress with `scouttrace preview --json`.
+`scouttrace init` creates `~/.scouttrace/config.yaml`. Built-in host patching can then be enabled with `scouttrace hosts patch` for supported MCP hosts: `claude-desktop`, `claude-code`, `cursor`, `codex`, `opencode`, `openclaw`, and `hermes`. JSON hosts use inline `_scouttrace` markers; Codex TOML and Hermes YAML configs use external backup metadata under `~/.scouttrace/backups/<host>/markers.json` so secrets in env blocks are not duplicated. For Windsurf, Continue, or other MCP clients without a built-in host ID, use the manual `scouttrace proxy -- ...` wrapper examples below. You can preview what will be captured before any network egress with `scouttrace preview --json`.
 
 ## How to use ScoutTrace
 
@@ -379,7 +379,7 @@ scouttrace -v hosts list      # -v = verbose, -vv = more verbose
 
 The examples below show the same ScoutTrace command family for five common AI coding/agent environments. WebhookScout-specific examples use the `webhookscout` destination and store credentials through environment-variable or keychain-style references. Replace `[REDACTED]` with your real WebhookScout API key only in your local shell, never in committed files, and replace `<webhookscout-agent-id>` with the agent ID from the WebhookScout portal.
 
-> **Support note:** ScoutTrace has built-in JSON host patchers for `claude-code`, `claude-desktop`, and `cursor`. For Codex, OpenClaw, and Hermes, use `--hosts none` plus explicit `scouttrace proxy -- ...` wrapper commands unless that system documents a compatible MCP JSON config format.
+> **Support note:** ScoutTrace now has built-in host patchers for `claude-code`, `claude-desktop`, `cursor`, `codex`, `opencode`, `openclaw`, and `hermes`. Use `scouttrace hosts patch --host <id>` to register natively. Manual `scouttrace proxy -- ...` wrapping is still available for unsupported clients or one-off server commands.
 
 Shared variables used by several examples:
 
@@ -628,28 +628,33 @@ It converts Claude Code hook JSON into the same ScoutTrace `ToolCallEvent` envel
 
 #### `scouttrace hosts list|patch|unpatch` with WebhookScout
 
-Use this when the AI system stores MCP servers in a JSON config file ScoutTrace can patch. Built-in host IDs work directly. For systems without a built-in patcher, list support status here and configure `scouttrace proxy -- ...` manually in that system instead.
+Use this when the AI system stores MCP servers in a config file ScoutTrace can patch. Built-in host IDs work directly across JSON, TOML, and YAML host formats. ScoutTrace backs up the original file before patching; use `hosts unpatch` or `undo` to roll back.
 
 ```sh
-# Claude Code.
+# See every built-in host and where ScoutTrace expects its config.
 scouttrace hosts list --json
+
+# Claude Code.
 scouttrace hosts patch --host claude-code
 scouttrace hosts unpatch --host claude-code
 
-# Codex: no built-in host patcher yet; confirm manually and use `proxy`.
-scouttrace --home ~/.scouttrace-codex hosts list --json
-# Then configure Codex to launch: scouttrace --home ~/.scouttrace-codex proxy --server-name <server> -- <original-command>
+# Codex native registration: ~/.codex/config.toml, [mcp_servers.<name>].
+scouttrace --home ~/.scouttrace-codex hosts patch --host codex
+scouttrace --home ~/.scouttrace-codex hosts unpatch --host codex
 
-# OpenClaw: no built-in host patcher yet; confirm manually and use `proxy`.
-scouttrace --home ~/.scouttrace-openclaw hosts list --json
-# Then configure OpenClaw to launch: scouttrace --home ~/.scouttrace-openclaw proxy --server-name <server> -- <original-command>
+# OpenCode native registration: ~/.config/opencode/opencode.json, top-level "mcp" object.
+scouttrace --home ~/.scouttrace-opencode hosts patch --host opencode
+scouttrace --home ~/.scouttrace-opencode hosts unpatch --host opencode
 
-# Hermes: no built-in host patcher yet; confirm manually and use `proxy`.
-scouttrace --home ~/.scouttrace-hermes hosts list --json
-# Then configure Hermes to launch: scouttrace --home ~/.scouttrace-hermes proxy --server-name <server> -- <original-command>
+# OpenClaw alias for OpenCode-style configs.
+scouttrace --home ~/.scouttrace-openclaw hosts patch --host openclaw
+scouttrace --home ~/.scouttrace-openclaw hosts unpatch --host openclaw
+
+# Hermes Agent native registration: ~/.hermes/config.yaml, top-level mcp_servers.
+scouttrace --home ~/.scouttrace-hermes hosts patch --host hermes
+scouttrace --home ~/.scouttrace-hermes hosts unpatch --host hermes
 
 # Cursor.
-scouttrace hosts list --json
 scouttrace hosts patch --host cursor
 scouttrace hosts unpatch --host cursor
 ```

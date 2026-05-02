@@ -164,7 +164,8 @@ func hostsUnpatch(g *Globals, args []string) int {
 			return 1
 		}
 	}
-	res, err := hosts.Unpatch(h, path)
+	bak := filepath.Join(g.Home, "backups", *hostID)
+	res, err := hosts.Unpatch(h, path, bak)
 	if err != nil {
 		fmt.Fprintln(g.Stderr, err)
 		return 1

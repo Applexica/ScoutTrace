@@ -89,7 +89,7 @@ func TestUndoFromBackup(t *testing.T) {
 	if err := os.WriteFile(cfg, patched, 0o600); err != nil {
 		t.Fatalf("write patched: %v", err)
 	}
-	used, err := UndoFromBackup(cfg, bak)
+	used, err := UndoFromBackup(&Host{Format: FormatJSON}, cfg, bak)
 	if err != nil {
 		t.Fatalf("UndoFromBackup: %v", err)
 	}

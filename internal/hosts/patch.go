@@ -142,9 +142,6 @@ func patchEntry(entry map[string]any, name, proxyExe string) (map[string]any, er
 			"args":    sliceToAny(origArgs),
 		},
 	}
-	if env, ok := entry["env"]; ok {
-		out["_scouttrace"].(map[string]any)["original"].(map[string]any)["env"] = env
-	}
 	return out, nil
 }
 

@@ -68,7 +68,7 @@ func CmdUndo(ctx context.Context, g *Globals, args []string) int {
 			}
 			continue
 		}
-		used, err := hosts.UndoFromBackup(path, bak)
+		used, err := hosts.UndoFromBackup(h, path, bak)
 		if err != nil {
 			fmt.Fprintln(g.Stderr, err)
 			exit = 1
