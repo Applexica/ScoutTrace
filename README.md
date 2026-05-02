@@ -256,17 +256,88 @@ scouttrace doctor
 
 > Do not paste API keys into MCP host config files. ScoutTrace config stores credential references such as `env://...`, `keychain://...`, or `encfile://...`, not raw secrets. In the interactive wizard you may paste the WebhookScout API key at the credential prompt; ScoutTrace stores it securely and writes only a credential reference.
 
-### Updating from source
+### Updating ScoutTrace
+
+Updating has two parts: check what you have versus what is available, then upgrade by the same path you originally installed.
+
+#### Check the installed version
+
+```sh
+scouttrace version            # human-readable, e.g. 0.1.0
+scouttrace version --json     # machine-readable for scripts
+```
+
+After upgrading, re-run `scouttrace version` and `scouttrace doctor` to confirm the new binary is on `PATH` and the config still validates:
+
+```sh
+scouttrace version
+scouttrace doctor
+```
+
+#### Check the latest available version (Homebrew)
+
+`brew info` shows the version in the tap alongside the version Homebrew has installed locally. Refresh the tap first.
+
+```sh
+brew update
+brew info scouttrace          # shows tap (latest) vs installed
+brew outdated scouttrace      # exits non-zero if an upgrade is available
+```
+
+#### Upgrade via Homebrew
+
+```sh
+brew update
+brew upgrade scouttrace
+scouttrace version
+scouttrace doctor
+```
+
+If you tapped from a fork or alternate tap and want to confirm where the formula came from:
+
+```sh
+brew tap                      # lists installed taps
+brew info scouttrace          # shows the tap path under "From:"
+```
+
+#### Upgrade from a source build
+
+For installs that came from `go build` (no Homebrew involvement), pull the latest source and rebuild. The commands below assume the layout used in the source-install steps above.
 
 ```sh
 cd ScoutTrace
-git pull
+git fetch --tags
+git checkout main             # or a release tag, e.g. git checkout vX.Y.Z
+git pull --ff-only
 go test ./...
 go build -o scouttrace ./cmd/scouttrace
 mv scouttrace "$HOME/.local/bin/scouttrace"
+scouttrace version
+scouttrace doctor
 ```
 
-On Windows, rebuild `scouttrace.exe` and move it back to `%USERPROFILE%\bin`.
+To target a specific released version instead of `main`:
+
+```sh
+cd ScoutTrace
+git fetch --tags
+git checkout vX.Y.Z           # replace with a real tag from `git tag --list`
+go build -o scouttrace ./cmd/scouttrace
+mv scouttrace "$HOME/.local/bin/scouttrace"
+scouttrace version
+```
+
+On Windows PowerShell, rebuild `scouttrace.exe` and move it back to `%USERPROFILE%\bin`:
+
+```powershell
+cd ScoutTrace
+git pull
+go build -o scouttrace.exe ./cmd/scouttrace
+Move-Item .\scouttrace.exe "$env:USERPROFILE\bin\scouttrace.exe" -Force
+scouttrace version
+```
+
+> **Compare installed vs available at a glance.** For Homebrew installs, run `scouttrace version` and `brew info scouttrace` side by side. For source installs, run `scouttrace version`, `git -C ScoutTrace tag --points-at HEAD`, and `git -C ScoutTrace log -1 --oneline` so you know exactly which checkout produced your binary.
 
 ### Future package managers
 
@@ -315,6 +386,154 @@ Shared variables used by several examples:
 ```sh
 export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='***'
 export WEBHOOKSCOUT_AGENT_ID='<webhookscout-agent-id>'
+```
+
+#### Choosing a ScoutTrace home: shared global vs isolated per-host
+
+ScoutTrace stores everything (config, queue, backups, audit log, credentials) under a *home* directory selected by `--home` (or `SCOUTTRACE_HOME`). You have two practical options. Pick one and reuse it consistently.
+
+**Shared global home (`~/.scouttrace`)**
+
+Use one home for every MCP host on the machine. Same destination, same redaction policy, same queue, same approval state. Easiest to operate; one `scouttrace doctor` covers everything.
+
+```sh
+# One-time setup, shared by Claude Code, Claude Desktop, Cursor, Codex, OpenClaw, etc.
+scouttrace init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
+  --hosts none --yes
+
+scouttrace destination approve default
+scouttrace doctor
+
+# Every host then wraps its MCP servers with the same proxy/home.
+scouttrace proxy --server-name <server> -- <original-command>
+```
+
+**Isolated per-host homes (`~/.scouttrace-<host>`)**
+
+Use one home per MCP host when you want them logically separated — e.g. different destinations, different redaction profiles, different agent IDs, or simply to keep queues from one host out of another. You will run `init`, `approve`, `doctor`, and `start` against each home.
+
+```sh
+# Codex profile, fully separate from Claude Code's defaults.
+scouttrace --home ~/.scouttrace-codex init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
+  --hosts none --yes
+
+scouttrace --home ~/.scouttrace-codex destination approve default
+scouttrace --home ~/.scouttrace-codex doctor
+
+# Codex's MCP servers must use the same --home in their proxy wrapper.
+scouttrace --home ~/.scouttrace-codex proxy --server-name <server> -- <original-command>
+```
+
+> **Heads-up:** the `--home` you use when starting the proxy must match the one you used for `init`. Otherwise the proxy reads a different (or empty) config and will not deliver to the destination you expect.
+
+You can also point at a temporary home for safe experiments without disturbing real installs:
+
+```sh
+scouttrace --home /tmp/scout-isolated init --hosts none --destination stdout --yes
+scouttrace --home /tmp/scout-isolated preview --json \
+  | scouttrace --home /tmp/scout-isolated queue inject --destination default
+scouttrace --home /tmp/scout-isolated queue flush
+```
+
+#### Proxy-wrap examples for Claude Desktop and a generic MCP host
+
+The five environments covered later (Claude Code, Codex, OpenClaw, Hermes, Cursor) all reduce to the same pattern: launch the upstream MCP server under `scouttrace proxy --server-name <name> -- <original-command>`. Two more common cases:
+
+**Claude Desktop (built-in patcher; shared global home)**
+
+Claude Desktop has a JSON config (`claude_desktop_config.json`) that ScoutTrace can patch directly.
+
+```sh
+# One-time, shared global home.
+scouttrace init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
+  --hosts claude-desktop --yes
+
+scouttrace destination approve default
+
+# Inspect what was patched, and roll back if needed.
+scouttrace hosts list --json
+scouttrace undo --host claude-desktop          # restores from ~/.scouttrace/backups
+```
+
+**Claude Desktop (isolated home)**
+
+```sh
+scouttrace --home ~/.scouttrace-desktop init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
+  --hosts claude-desktop --yes
+
+scouttrace --home ~/.scouttrace-desktop destination approve default
+scouttrace --home ~/.scouttrace-desktop hosts list --json
+```
+
+After patching Claude Desktop, fully quit and relaunch it (the menu bar icon must restart) so it re-reads `claude_desktop_config.json`.
+
+**Generic / unsupported MCP host (no built-in patcher)**
+
+For any MCP-capable client without a ScoutTrace patcher (Windsurf, Continue, your own host, an in-house agent), edit the host's MCP server definition by hand. Replace each entry's command with the same command wrapped by `scouttrace proxy`. Pattern:
+
+```jsonc
+// Before
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"]
+    }
+  }
+}
+
+// After (shared global home)
+{
+  "mcpServers": {
+    "github": {
+      "command": "scouttrace",
+      "args": ["proxy", "--server-name", "github", "--",
+               "npx", "-y", "@modelcontextprotocol/server-github"]
+    }
+  }
+}
+
+// After (isolated home for this host)
+{
+  "mcpServers": {
+    "github": {
+      "command": "scouttrace",
+      "args": ["--home", "/Users/you/.scouttrace-myhost",
+               "proxy", "--server-name", "github", "--",
+               "npx", "-y", "@modelcontextprotocol/server-github"]
+    }
+  }
+}
+```
+
+Quick smoke test of the wrapped command from a shell, before pointing the host at it:
+
+```sh
+# Shared global home.
+scouttrace proxy --server-name github -- npx -y @modelcontextprotocol/server-github
+
+# Isolated home.
+scouttrace --home ~/.scouttrace-myhost proxy --server-name github \
+  -- npx -y @modelcontextprotocol/server-github
+```
+
+For a host that exposes its own SDK or spawns Python/Node agents directly (no MCP server), use `scouttrace run` to inject ScoutTrace env vars instead:
+
+```sh
+scouttrace run -- python ./agents/my_agent.py
+scouttrace --home ~/.scouttrace-myhost run -- node ./agents/my-agent.mjs
 ```
 
 #### `scouttrace init` with WebhookScout
@@ -368,18 +587,36 @@ scouttrace init \
 
 `scouttrace proxy` captures MCP servers that are launched through a `scouttrace proxy -- ...` wrapper. Claude Code also has built-in tools and plugin-provided MCP tools, such as `plugin:playwright:playwright`, that can be available in `/mcp` without launching through a user-editable MCP server command. Those calls will not pass through the proxy. Use the Claude Code PostToolUse hook below to capture them too.
 
-Install the hook from the same project directory you open in Claude Code:
+##### Local vs global install: pick a Claude Code settings scope
+
+Claude Code reads hook configuration from three different settings files. ScoutTrace's `claude-hook install --scope` flag picks which file to write into. Choose by **who** should see the hook and **how it should be persisted**:
+
+| `--scope`   | Settings file written                          | Visibility / persistence                                                | When to use                                                              |
+|-------------|------------------------------------------------|-------------------------------------------------------------------------|--------------------------------------------------------------------------|
+| `local`     | `<project>/.claude/settings.local.json`        | Personal to you in this project; usually gitignored.                    | Install on your own machine without affecting teammates or other repos.  |
+| `project`   | `<project>/.claude/settings.json`              | Committed to the repo; everyone on the project picks it up.             | Team-wide capture for a single repo (review the diff before committing). |
+| `user`      | `~/.claude/settings.json`                      | Per-user global; applies across every Claude Code project you open.     | "Capture every Claude Code session everywhere on this machine."          |
+
+Install the hook from the same project directory you open in Claude Code (for `local` and `project`):
 
 ```sh
-# Personal project-local hook; writes .claude/settings.local.json.
+# Local install: personal, project-scoped, gitignored — writes .claude/settings.local.json.
 scouttrace claude-hook install --scope local --project-dir "$PWD" --destination default
 
-# Team-shared project hook; writes .claude/settings.json.
+# Project install: team-shared via git — writes .claude/settings.json.
 scouttrace claude-hook install --scope project --project-dir "$PWD" --destination default
 
-# Global hook for all Claude Code projects.
+# Global install: applies to every Claude Code project — writes ~/.claude/settings.json.
 scouttrace claude-hook install --scope user --destination default
 ```
+
+After installing, restart Claude Code (or reopen the project) so the new hook settings are picked up. To preview which JSON block ScoutTrace would write before touching disk:
+
+```sh
+scouttrace claude-hook snippet --destination default
+```
+
+To uninstall, edit the relevant settings file and remove the `PostToolUse` entry that runs `scouttrace ... claude-hook post-tool-use`. There is no `claude-hook uninstall` subcommand today.
 
 The installed hook runs after every Claude Code tool call:
 
@@ -387,13 +624,7 @@ The installed hook runs after every Claude Code tool call:
 scouttrace --home ~/.scouttrace claude-hook post-tool-use --destination default --flush
 ```
 
-It converts Claude Code hook JSON into the same ScoutTrace `ToolCallEvent` envelope, marks the source as `claude_code_hook`, redacts `tool_input` and `tool_response`, enqueues the event, and performs a best-effort flush. This is the recommended path for observing Claude Code Playwright/browser activity and other built-in/plugin tools. Restart Claude Code or reopen the project after installing the hook.
-
-You can preview the JSON settings block without writing files:
-
-```sh
-scouttrace claude-hook snippet --destination default
-```
+It converts Claude Code hook JSON into the same ScoutTrace `ToolCallEvent` envelope, marks the source as `claude_code_hook`, redacts `tool_input` and `tool_response`, enqueues the event, and performs a best-effort flush. This is the recommended path for observing Claude Code Playwright/browser activity and other built-in/plugin tools.
 
 #### `scouttrace hosts list|patch|unpatch` with WebhookScout
 
