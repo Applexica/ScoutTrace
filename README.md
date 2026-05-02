@@ -15,6 +15,20 @@ Captured events are written to a local on-disk queue, then dispatched to **any H
 - **Pluggable destinations.** WebhookScout, generic HTTP webhook, NDJSON `file://...`, or `stdout`. Network destinations require explicit first-send approval.
 - **Auditable, reversible host changes.** Every host-config patch is backed up; `scouttrace undo` restores the most recent backup. Setup and patching flows expose dry-run or rollback paths so you can inspect changes before trusting them.
 
+### Claude Code integration in one command
+
+ScoutTrace can start capturing real Claude Code tool activity without complicated setup — no proxy wiring, no MCP host patching. Run a single command from your Claude Code project directory:
+
+```sh
+scouttrace claude-hook install --scope local --project-dir "$PWD" --destination default
+```
+
+Then use Claude Code normally. Tool events appear in your WebhookScout **Agents** view as they happen.
+
+![WebhookScout Agents view showing captured Claude Code tool events](docs/assets/webhookscout-agent-events.png)
+
+![WebhookScout Agents view showing per-tool activity for a Claude Code session](docs/assets/webhookscout-agent-tools.png)
+
 ### How it works
 
 ```mermaid
