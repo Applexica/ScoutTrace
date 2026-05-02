@@ -761,12 +761,24 @@ scouttrace hosts list
 scouttrace hosts list --json
 ```
 
-Patch a host so its MCP servers run under the proxy. The original config is backed up under `~/.scouttrace/backups/<host>/`:
+Patch a host so its existing MCP servers run under the proxy. The original config is backed up under `~/.scouttrace/backups/<host>/`:
 
 ```sh
 scouttrace hosts patch --host claude-desktop
 scouttrace hosts patch --host cursor --servers github,filesystem
 scouttrace hosts patch --host claude-code --config-path /path/to/claude_code_config.json
+```
+
+If `init` prints `No selected MCP host configs were patched`, ScoutTrace is configured but not yet observing anything. ScoutTrace only captures MCP server traffic; it cannot see Claude Code's built-in file/shell tools unless those tools are exposed through an MCP server wrapped by `scouttrace proxy`. Add an MCP server first, then re-run the relevant host patch command, or manually wrap a server:
+
+```sh
+# Example manual Claude Code MCP server wrapper.
+claude mcp add scouttrace-filesystem -- scouttrace proxy --server-name filesystem -- npx -y @modelcontextprotocol/server-filesystem "$PWD"
+
+# Approve WebhookScout delivery once, then flush queued events when testing.
+scouttrace destination approve default
+scouttrace queue stats
+scouttrace flush --destination default --yes
 ```
 
 If the host config has changed since the last patch (drift detection), the command refuses to write. Pass `--force` after reviewing:

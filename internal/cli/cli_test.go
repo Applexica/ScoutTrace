@@ -92,6 +92,39 @@ func TestInitInteractiveWizardWebhookScoutUsesEnvCredentialRef(t *testing.T) {
 	}
 }
 
+func TestInitWarnsWhenSelectedHostsWereNotPatched(t *testing.T) {
+	home := t.TempDir()
+	fakeUserHome := t.TempDir()
+	t.Setenv("HOME", fakeUserHome)
+
+	exit, stdout, stderr := runCLIWithInput(t, home, strings.Join([]string{
+		"stdout",
+		"claude-code",
+		"strict",
+		"y",
+	}, "\n")+"\n", "init")
+	if exit != 0 {
+		t.Fatalf("init exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "No selected MCP host configs were patched") {
+		t.Fatalf("expected no-host-patched warning, stderr=%s", stderr)
+	}
+	if !strings.Contains(stderr, "ScoutTrace will not capture Claude Code or MCP traffic until at least one MCP server is wrapped") {
+		t.Fatalf("expected capture guidance warning, stderr=%s", stderr)
+	}
+}
+
+func TestInitWebhookScoutPrintsApprovalNextStep(t *testing.T) {
+	home := t.TempDir()
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "webhookscout", "--agent-id", "agent_next", "--auth-header-ref", "env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY", "--hosts", "none")
+	if exit != 0 {
+		t.Fatalf("init exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Next: approve network delivery with `scouttrace destination approve default`") {
+		t.Fatalf("expected approval next-step guidance, stdout=%s", stdout)
+	}
+}
+
 func TestInitInteractiveWebhookScoutRawAPIKeyStoresCredentialRef(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")

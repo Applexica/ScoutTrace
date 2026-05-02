@@ -213,6 +213,9 @@ func CmdInit(ctx context.Context, g *Globals, args []string) int {
 		if len(patched) > 0 {
 			fmt.Fprintf(g.Stdout, "Patched hosts: %s\n", strings.Join(patched, ", "))
 		}
+		if destinationNeedsApproval(*destType) {
+			fmt.Fprintf(g.Stdout, "Next: approve network delivery with `scouttrace destination approve %s` before flushing queued events.\n", *destName)
+		}
 	}
 	return 0
 }
@@ -477,6 +480,15 @@ func stashOrEnvRef(g *Globals, key, value, envFallback string) (string, error) {
 	return "", fmt.Errorf("secure credential storage unavailable; set SCOUTTRACE_ENCFILE_PASSPHRASE and retry, or export %s and use --auth-header-ref env://%s", envFallback, envFallback)
 }
 
+func destinationNeedsApproval(destType string) bool {
+	switch destType {
+	case "webhookscout", "http":
+		return true
+	default:
+		return false
+	}
+}
+
 // patchSelectedHosts patches each host id listed in flag (comma-separated).
 // "none" or empty are no-ops. Failures are reported but do not block init —
 // users can re-run `scouttrace hosts patch` later.
@@ -488,6 +500,9 @@ func patchSelectedHosts(g *Globals, c *config.Config, flag string) []string {
 	var out []string
 	for _, id := range strings.Split(flag, ",") {
 		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
 		h, err := hosts.LookupHost(id)
 		if err != nil {
 			fmt.Fprintln(g.Stderr, "init: skip host:", err)
@@ -506,6 +521,9 @@ func patchSelectedHosts(g *Globals, c *config.Config, flag string) []string {
 		res, err := hosts.Patch(h, path, nil, g.ScoutBinary, bak, false, "")
 		if err != nil {
 			fmt.Fprintf(g.Stderr, "init: skip %s: %v\n", id, err)
+			if strings.Contains(err.Error(), `"`+h.ServersKey+`" key absent`) {
+				fmt.Fprintf(g.Stderr, "init: %s config exists but has no MCP servers to wrap. Add an MCP server first, then run `scouttrace hosts patch --host %s`.\n", id, id)
+			}
 			continue
 		}
 		if c.Hosts == nil {
@@ -520,6 +538,11 @@ func patchSelectedHosts(g *Globals, c *config.Config, flag string) []string {
 			_ = a.Append("cli", "hosts_patch", map[string]any{"host": id, "via": "init"})
 		}
 		out = append(out, id)
+	}
+	if len(out) == 0 {
+		fmt.Fprintln(g.Stderr, "init: No selected MCP host configs were patched.")
+		fmt.Fprintln(g.Stderr, "init: ScoutTrace will not capture Claude Code or MCP traffic until at least one MCP server is wrapped.")
+		fmt.Fprintln(g.Stderr, "init: If you only used Claude Code built-in file/shell tools, there is no MCP traffic for ScoutTrace to observe. Add or configure MCP servers, then run `scouttrace hosts patch --host <host>` or wrap a server with `scouttrace proxy -- ...`.")
 	}
 	return out
 }
