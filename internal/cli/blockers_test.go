@@ -182,6 +182,7 @@ func TestDispatcherPreservesEnvelopeBytes(t *testing.T) {
 func TestInitWebhookScoutSynthesizesAgentID(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase-correct-horse")
+	t.Setenv("SCOUTTRACE_DISABLE_KEYCHAIN", "1")
 	exit, _, stderr := runCLI(t, home, "init", "--yes",
 		"--destination", "webhookscout",
 		"--api-key", "whs_live_abcdefghijklmnop",
@@ -215,6 +216,7 @@ func TestInitWebhookScoutSynthesizesAgentID(t *testing.T) {
 func TestInitSetupTokenExchangedNotPromotedToAuthRef(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "another-passphrase-here")
+	t.Setenv("SCOUTTRACE_DISABLE_KEYCHAIN", "1")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/setup-tokens/exchange" {
 			t.Fatalf("unexpected path %s", r.URL.Path)

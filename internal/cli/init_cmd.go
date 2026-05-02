@@ -53,7 +53,7 @@ func CmdInit(ctx context.Context, g *Globals, args []string) int {
 		if ok := runInitWizard(g, initWizardPointers{
 			destName: destName, destType: destType, destURL: destURL,
 			destination: destination, destPath: destPath, apiBase: apiBase,
-			agentID: agentID, agentName: agentName, authRef: authRef,
+			agentID: agentID, agentName: agentName, apiKey: apiKey, authRef: authRef,
 			profile: profile, hostsFlag: hostsFlag, dryRun: dryRun,
 		}); !ok {
 			return 1
@@ -138,6 +138,8 @@ func CmdInit(ctx context.Context, g *Globals, args []string) int {
 		ref, err := stashOrEnvRef(g, "default-api-key", *apiKey, "SCOUTTRACE_WEBHOOKSCOUT_API_KEY")
 		if err != nil {
 			fmt.Fprintln(g.Stderr, "init:", err)
+			*apiKey = ""
+			return 1
 		}
 		*apiKey = ""
 		if *authRef == "" {
@@ -224,6 +226,7 @@ type initWizardPointers struct {
 	apiBase     *string
 	agentID     *string
 	agentName   *string
+	apiKey      *string
 	authRef     *string
 	profile     *string
 	hostsFlag   *string
@@ -251,7 +254,14 @@ func runInitWizard(g *Globals, p initWizardPointers) bool {
 			fmt.Fprintln(g.Stderr, "init: WebhookScout agent ID is required. Create/select an agent in the WebhookScout portal, then run init again.")
 			return false
 		}
-		*p.authRef = pr.ask("Credential reference", defaultString(*p.authRef, "env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY"))
+		cred := pr.ask("Credential reference or WebhookScout API key", defaultString(*p.authRef, "env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY"))
+		if looksLikeCredentialRef(cred) {
+			*p.authRef = cred
+		} else if strings.TrimSpace(cred) != "" {
+			*p.apiKey = cred
+			*p.authRef = ""
+			fmt.Fprintln(g.Stdout, "WebhookScout API key received; it will be stored securely and only a credential reference will be written to config.")
+		}
 	case "stdout":
 		// No additional destination fields.
 	case "file":
@@ -349,6 +359,11 @@ func defaultString(v, def string) string {
 		return def
 	}
 	return v
+}
+
+func looksLikeCredentialRef(v string) bool {
+	s := strings.TrimSpace(v)
+	return strings.HasPrefix(s, "env://") || strings.HasPrefix(s, "keychain://") || strings.HasPrefix(s, "encfile://")
 }
 
 func yesish(v string) bool {
@@ -452,10 +467,14 @@ func stashSecret(g *Globals, key, value string) error {
 // that fails (no passphrase), the user is told to populate envFallback
 // and the function returns env://envFallback so the config still resolves.
 func stashOrEnvRef(g *Globals, key, value, envFallback string) (string, error) {
+	keychainRef := "keychain://scouttrace/webhookscout/default"
+	if err := creds.NewKeychainStore().Put(strings.TrimPrefix(keychainRef, "keychain://"), value); err == nil {
+		return keychainRef, nil
+	}
 	if err := stashSecret(g, key, value); err == nil {
 		return "encfile://" + key, nil
 	}
-	return "env://" + envFallback, fmt.Errorf("encfile not configured; set %s before running ScoutTrace", envFallback)
+	return "", fmt.Errorf("secure credential storage unavailable; set SCOUTTRACE_ENCFILE_PASSPHRASE and retry, or export %s and use --auth-header-ref env://%s", envFallback, envFallback)
 }
 
 // patchSelectedHosts patches each host id listed in flag (comma-separated).

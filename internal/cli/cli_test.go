@@ -92,6 +92,62 @@ func TestInitInteractiveWizardWebhookScoutUsesEnvCredentialRef(t *testing.T) {
 	}
 }
 
+func TestInitInteractiveWebhookScoutRawAPIKeyStoresCredentialRef(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	t.Setenv("SCOUTTRACE_DISABLE_KEYCHAIN", "1")
+	rawKey := "whs_test_raw_key_for_wizard"
+	exit, stdout, stderr := runCLIWithInput(t, home, strings.Join([]string{
+		"webhookscout",
+		"https://api.webhookscout.test",
+		"agent_raw_key",
+		rawKey,
+		"none",
+		"strict",
+		"y",
+	}, "\n")+"\n", "init")
+	if exit != 0 {
+		t.Fatalf("interactive raw-key init exit = %d\nstdout:%s\nstderr:%s", exit, stdout, stderr)
+	}
+	if strings.Contains(stdout+stderr, rawKey) {
+		t.Fatalf("raw API key leaked in wizard output\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	exit, out, stderr := runCLI(t, home, "config", "show", "--json")
+	if exit != 0 {
+		t.Fatalf("config show exit=%d stderr=%s", exit, stderr)
+	}
+	if strings.Contains(out, rawKey) {
+		t.Fatalf("raw API key leaked in config:\n%s", out)
+	}
+	if !strings.Contains(out, `"auth_header_ref": "encfile://default-api-key"`) {
+		t.Fatalf("expected encfile auth ref for pasted API key, config:\n%s", out)
+	}
+}
+
+func TestInitInteractiveWebhookScoutRawAPIKeyWithoutStorageFailsSafely(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SCOUTTRACE_DISABLE_KEYCHAIN", "1")
+	rawKey := "whs_test_raw_key_without_storage"
+	exit, stdout, stderr := runCLIWithInput(t, home, strings.Join([]string{
+		"webhookscout",
+		"https://api.webhookscout.test",
+		"agent_raw_key",
+		rawKey,
+		"none",
+		"strict",
+		"y",
+	}, "\n")+"\n", "init")
+	if exit == 0 {
+		t.Fatalf("expected raw API key without secure storage to fail")
+	}
+	if strings.Contains(stdout+stderr, rawKey) {
+		t.Fatalf("raw API key leaked after storage failure\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(home, "config.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("config should not be written when raw key cannot be stored; stat err=%v", err)
+	}
+}
+
 func TestInitInteractiveEmptyStdinDoesNotWriteConfig(t *testing.T) {
 	home := t.TempDir()
 	exit, stdout, stderr := runCLIWithInput(t, home, "", "init")
@@ -109,6 +165,7 @@ func TestInitInteractiveEmptyStdinDoesNotWriteConfig(t *testing.T) {
 func TestInitSetupTokenDryRunDoesNotExchangeOrWriteCredentials(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	t.Setenv("SCOUTTRACE_DISABLE_KEYCHAIN", "1")
 	called := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -133,6 +190,7 @@ func TestInitSetupTokenDryRunDoesNotExchangeOrWriteCredentials(t *testing.T) {
 func TestInitSetupTokenExchangeErrorDoesNotLeakResponseBody(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	t.Setenv("SCOUTTRACE_DISABLE_KEYCHAIN", "1")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token setup_test_secret produced api key whs_secret", http.StatusBadRequest)
 	}))
@@ -152,6 +210,7 @@ func TestInitSetupTokenExchangeErrorDoesNotLeakResponseBody(t *testing.T) {
 func TestInitSetupTokenRejectsPlainHTTPNonLocalhost(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	t.Setenv("SCOUTTRACE_DISABLE_KEYCHAIN", "1")
 	for _, apiBase := range []string{"http://api.example.com", "http://127.evil.com", "http://127.0.0.1.evil.com"} {
 		exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "webhookscout", "--api-base", apiBase, "--setup-token", "setup_test_secret", "--hosts", "none")
 		if exit == 0 {
@@ -166,6 +225,7 @@ func TestInitSetupTokenRejectsPlainHTTPNonLocalhost(t *testing.T) {
 func TestInitSetupTokenRejectsRedirects(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	t.Setenv("SCOUTTRACE_DISABLE_KEYCHAIN", "1")
 	targetCalled := false
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		targetCalled = true
@@ -191,6 +251,7 @@ func TestInitSetupTokenRejectsRedirects(t *testing.T) {
 func TestInitSetupTokenExchangesAndStoresAPIKey(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SCOUTTRACE_ENCFILE_PASSPHRASE", "test-passphrase")
+	t.Setenv("SCOUTTRACE_DISABLE_KEYCHAIN", "1")
 	var gotToken string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/setup-tokens/exchange" {

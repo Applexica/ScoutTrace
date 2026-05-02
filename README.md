@@ -47,7 +47,7 @@ flowchart LR
 4. **Local queue.** Redacted envelopes are appended to `~/.scouttrace/queue/pending/`. The on-disk queue stores one compressed record per event; the dispatcher renames rows into `inflight/` atomically before delivery and into `dead/` after exhausting retries.
 5. **Dispatch.** A dispatcher drains the queue and POSTs envelopes to each configured destination. It runs either in-process inside the proxy (for short-lived hosts) or as a long-running sidecar (`scouttrace start`). Network destinations are gated by first-send approval (`scouttrace destination approve …`) — until you explicitly approve, ScoutTrace will refuse to send to that host.
 6. **Destinations.** ScoutTrace ships with four:
-   - **`webhookscout`** — adapter for [WebhookScout](https://www.webhookscout.com). Tokens are referenced as `env://NAME` or `keychain://NAME`, never written to config in plaintext.
+   - **`webhookscout`** — adapter for [WebhookScout](https://www.webhookscout.com). Tokens are referenced as `env://NAME`, `keychain://...`, or `encfile://...`, never written to config in plaintext. On macOS, pasted WebhookScout API keys are stored in Keychain automatically during `scouttrace init`.
    - **`http`** — generic webhook; you supply the URL and an auth-header reference.
    - **`file`** — append redacted envelopes to a local NDJSON file (`file:///path/events.ndjson`).
    - **`stdout`** — print envelopes to stdout. Useful for `--dry-run`-style flows and CI.
@@ -254,7 +254,7 @@ scouttrace init \
 scouttrace doctor
 ```
 
-> Do not paste API keys into MCP host config files. ScoutTrace config stores credential references such as `env://...` or `keychain://...`, not raw secrets.
+> Do not paste API keys into MCP host config files. ScoutTrace config stores credential references such as `env://...`, `keychain://...`, or `encfile://...`, not raw secrets. In the interactive wizard you may paste the WebhookScout API key at the credential prompt; ScoutTrace stores it securely and writes only a credential reference.
 
 ### Updating from source
 
@@ -319,7 +319,7 @@ export WEBHOOKSCOUT_AGENT_ID='<webhookscout-agent-id>'
 
 #### `scouttrace init` with WebhookScout
 
-Create the local ScoutTrace config and point it at WebhookScout. Use either a WebhookScout API key plus agent ID, or a short-lived setup token if your WebhookScout portal exposes one.
+Create the local ScoutTrace config and point it at WebhookScout. Use either a WebhookScout API key plus agent ID, or a short-lived setup token if your WebhookScout portal exposes one. In the interactive wizard, the credential prompt accepts either a credential reference like `env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY` or the raw WebhookScout API key; raw keys are stored in Keychain/encfile and are not written to config.
 
 ```sh
 # Claude Code: built-in host id.

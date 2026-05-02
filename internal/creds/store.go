@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 )
 
@@ -55,7 +57,7 @@ type MultiStore struct {
 func NewMultiStore() *MultiStore {
 	return &MultiStore{
 		Env:      &EnvStore{},
-		Keychain: &keychainStub{},
+		Keychain: NewKeychainStore(),
 	}
 }
 
@@ -171,8 +173,72 @@ func (e *EnvStore) List() ([]string, error) {
 	return out, nil
 }
 
-// keychainStub returns ErrUnavailable for all operations. Production
-// builds replace this with an OS-specific implementation.
+// NewKeychainStore returns an OS keychain-backed store when available.
+func NewKeychainStore() Store {
+	if os.Getenv("SCOUTTRACE_DISABLE_KEYCHAIN") == "1" {
+		return &keychainStub{}
+	}
+	if runtime.GOOS == "darwin" {
+		return &securityKeychainStore{service: "scouttrace"}
+	}
+	return &keychainStub{}
+}
+
+type securityKeychainStore struct{ service string }
+
+func (s *securityKeychainStore) Get(key string) (string, error) {
+	out, err := exec.Command("security", "find-generic-password", "-a", key, "-s", s.service, "-w").Output()
+	if err != nil {
+		return "", mapSecurityErr(err)
+	}
+	v := strings.TrimRight(string(out), "\r\n")
+	if v == "" {
+		return "", fmt.Errorf("%w: keychain %q", ErrNotFound, key)
+	}
+	return v, nil
+}
+
+func (s *securityKeychainStore) Put(key, value string) error {
+	cmd := exec.Command("security", "add-generic-password", "-a", key, "-s", s.service, "-w", value, "-U")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("keychain put: %w: %s", mapSecurityErr(err), sanitizeSecurityOutput(out))
+	}
+	return nil
+}
+
+func (s *securityKeychainStore) Delete(key string) error {
+	cmd := exec.Command("security", "delete-generic-password", "-a", key, "-s", s.service)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		mapped := mapSecurityErr(err)
+		if errors.Is(mapped, ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("keychain delete: %w: %s", mapped, sanitizeSecurityOutput(out))
+	}
+	return nil
+}
+
+func (s *securityKeychainStore) List() ([]string, error) { return nil, nil }
+
+func mapSecurityErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := err.(*exec.ExitError); ok {
+		return ErrNotFound
+	}
+	return ErrUnavailable
+}
+
+func sanitizeSecurityOutput(out []byte) string {
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return "security command failed"
+	}
+	return s
+}
+
+// keychainStub returns ErrUnavailable for all operations.
 type keychainStub struct{}
 
 func (*keychainStub) Get(string) (string, error) { return "", ErrUnavailable }
