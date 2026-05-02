@@ -245,7 +245,7 @@ scouttrace doctor
 For WebhookScout, use a WebhookScout API key plus the agent ID shown/created in the WebhookScout portal:
 
 ```sh
-export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='***'
 scouttrace init \
   --destination webhookscout \
   --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
@@ -313,7 +313,7 @@ The examples below show the same ScoutTrace command family for five common AI co
 Shared variables used by several examples:
 
 ```sh
-export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='***'
 export WEBHOOKSCOUT_AGENT_ID='<webhookscout-agent-id>'
 ```
 
@@ -361,6 +361,38 @@ scouttrace init \
   --agent-id "$WEBHOOKSCOUT_AGENT_ID" \
   --hosts cursor \
   --yes
+```
+
+
+#### Claude Code hooks for built-in and plugin tools
+
+`scouttrace proxy` captures MCP servers that are launched through a `scouttrace proxy -- ...` wrapper. Claude Code also has built-in tools and plugin-provided MCP tools, such as `plugin:playwright:playwright`, that can be available in `/mcp` without launching through a user-editable MCP server command. Those calls will not pass through the proxy. Use the Claude Code PostToolUse hook below to capture them too.
+
+Install the hook from the same project directory you open in Claude Code:
+
+```sh
+# Personal project-local hook; writes .claude/settings.local.json.
+scouttrace claude-hook install --scope local --project-dir "$PWD" --destination default
+
+# Team-shared project hook; writes .claude/settings.json.
+scouttrace claude-hook install --scope project --project-dir "$PWD" --destination default
+
+# Global hook for all Claude Code projects.
+scouttrace claude-hook install --scope user --destination default
+```
+
+The installed hook runs after every Claude Code tool call:
+
+```sh
+scouttrace --home ~/.scouttrace claude-hook post-tool-use --destination default --flush
+```
+
+It converts Claude Code hook JSON into the same ScoutTrace `ToolCallEvent` envelope, marks the source as `claude_code_hook`, redacts `tool_input` and `tool_response`, enqueues the event, and performs a best-effort flush. This is the recommended path for observing Claude Code Playwright/browser activity and other built-in/plugin tools. Restart Claude Code or reopen the project after installing the hook.
+
+You can preview the JSON settings block without writing files:
+
+```sh
+scouttrace claude-hook snippet --destination default
 ```
 
 #### `scouttrace hosts list|patch|unpatch` with WebhookScout
@@ -718,7 +750,7 @@ scouttrace init --hosts claude-desktop,cursor --destination stdout --yes
 WebhookScout setup with an API key and agent ID from the WebhookScout portal:
 
 ```sh
-export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='[REDACTED]'   # populate locally; never commit
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='***'   # populate locally; never commit
 scouttrace init \
   --destination webhookscout \
   --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
@@ -732,7 +764,7 @@ If your WebhookScout portal provides a short-lived setup token, ScoutTrace can e
 Custom HTTP webhook with a credential reference:
 
 ```sh
-export MY_WEBHOOK_TOKEN='[REDACTED]'
+export MY_WEBHOOK_TOKEN='***'
 scouttrace init \
   --destination https://hooks.example.internal/scouttrace \
   --auth-header-ref env://MY_WEBHOOK_TOKEN \

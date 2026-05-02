@@ -608,3 +608,117 @@ func TestHostsListJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeHookPostToolUseCapturesPluginMCPTool(t *testing.T) {
+	home := t.TempDir()
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "stdout", "--hosts", "none", "--profile", "standard")
+	if exit != 0 {
+		t.Fatalf("init exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	payload := `{
+		"session_id":"claude-session-1",
+		"hook_event_name":"PostToolUse",
+		"tool_name":"mcp__playwright__browser_navigate",
+		"tool_input":{"url":"https://example.com/?token=whs_test_abcdefghijklmnop"},
+		"tool_response":{"content":[{"type":"text","text":"navigated"}]}
+	}`
+	exit, stdout, stderr = runCLIWithInput(t, home, payload, "--json", "claude-hook", "post-tool-use", "--destination", "default")
+	if exit != 0 {
+		t.Fatalf("hook exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"destination":"default"`) {
+		t.Fatalf("hook JSON missing destination: %s", stdout)
+	}
+	exit, out, stderr := runCLI(t, home, "queue", "list", "--destination", "default", "--limit", "1")
+	if exit != 0 {
+		t.Fatalf("queue list exit=%d stderr=%s", exit, stderr)
+	}
+	if !strings.Contains(out, `"kind":"claude_code_hook"`) || !strings.Contains(out, `"name":"playwright"`) || !strings.Contains(out, `"name":"browser_navigate"`) {
+		t.Fatalf("hook event missing source/server/tool fields:\n%s", out)
+	}
+	if strings.Contains(out, "whs_test_abcdefghijklmnop") {
+		t.Fatalf("hook event leaked secret in queued payload:\n%s", out)
+	}
+	if !strings.Contains(out, "[REDACTED:") {
+		t.Fatalf("expected redaction marker in queued payload:\n%s", out)
+	}
+}
+
+func TestClaudeHookInstallWritesLocalSettings(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	exit, stdout, stderr := runCLI(t, home, "claude-hook", "install", "--scope", "local", "--project-dir", project, "--destination", "default")
+	if exit != 0 {
+		t.Fatalf("install exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	settingsPath := filepath.Join(project, ".claude", "settings.local.json")
+	b, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	text := string(b)
+	if !strings.Contains(text, "PostToolUse") || !strings.Contains(text, "claude-hook post-tool-use") || !strings.Contains(text, "--flush") {
+		t.Fatalf("settings missing hook command:\n%s", text)
+	}
+	// Reinstall is idempotent for the same generated command.
+	exit, _, stderr = runCLI(t, home, "claude-hook", "install", "--scope", "local", "--project-dir", project, "--destination", "default")
+	if exit != 0 {
+		t.Fatalf("second install exit=%d stderr=%s", exit, stderr)
+	}
+	b2, _ := os.ReadFile(settingsPath)
+	if strings.Count(string(b2), "claude-hook post-tool-use") != 1 {
+		t.Fatalf("hook command duplicated:\n%s", string(b2))
+	}
+}
+
+func TestClaudeHookPostToolUseFlushesToWebhookScout(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SCOUTTRACE_WEBHOOKSCOUT_API_KEY", "whs_hook_flush_test_key")
+	var gotPath, gotAuth string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		reader := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gz, err := gzip.NewReader(r.Body)
+			if err != nil {
+				t.Fatalf("gzip reader: %v", err)
+			}
+			defer gz.Close()
+			reader = gz
+		}
+		b, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatalf("body not JSON: %v\n%s", err, b)
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "webhookscout", "--api-base", srv.URL, "--agent-id", "agent-hook", "--auth-header-ref", "env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY", "--hosts", "none")
+	if exit != 0 {
+		t.Fatalf("init exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	exit, _, stderr = runCLI(t, home, "destination", "approve", "default")
+	if exit != 0 {
+		t.Fatalf("approve exit=%d stderr=%s", exit, stderr)
+	}
+	payload := `{"session_id":"claude-session-2","hook_event_name":"PostToolUse","tool_name":"mcp__playwright__browser_click","tool_input":{"selector":"button:text('Buy')"},"tool_response":{"content":[{"type":"text","text":"clicked"}]}}`
+	exit, _, stderr = runCLIWithInput(t, home, payload, "claude-hook", "post-tool-use", "--destination", "default", "--flush")
+	if exit != 0 {
+		t.Fatalf("hook exit=%d stderr=%s", exit, stderr)
+	}
+	if gotPath != "/api/mcp/agent-hook/events" {
+		t.Fatalf("path=%q", gotPath)
+	}
+	if gotAuth != "Bearer whs_hook_flush_test_key" {
+		t.Fatalf("Authorization=%q", gotAuth)
+	}
+	if gotBody["tool"] != "browser_click" || gotBody["status"] != "ok" {
+		t.Fatalf("unexpected body: %#v", gotBody)
+	}
+}

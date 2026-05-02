@@ -85,6 +85,7 @@ func allCommands() []Command {
 		{Name: "preview", Summary: "preview redaction on a synthetic event", Run: CmdPreview},
 		{Name: "policy", Summary: "manage redaction policies", Run: CmdPolicy},
 		{Name: "hosts", Summary: "list/patch/unpatch MCP hosts", Run: CmdHosts},
+		{Name: "claude-hook", Summary: "capture Claude Code built-in/plugin tool use via hooks", Run: CmdClaudeHook},
 		{Name: "config", Summary: "show/validate/set config", Run: CmdConfig},
 		{Name: "queue", Summary: "queue operations (list/inject/flush/stats)", Run: CmdQueue},
 		{Name: "flush", Summary: "alias for `queue flush`", Run: CmdFlush},
