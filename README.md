@@ -772,14 +772,23 @@ scouttrace hosts patch --host claude-code --config-path /path/to/claude_code_con
 If `init` prints `No selected MCP host configs were patched`, ScoutTrace is configured but not yet observing anything. ScoutTrace only captures MCP server traffic; it cannot see Claude Code's built-in file/shell tools unless those tools are exposed through an MCP server wrapped by `scouttrace proxy`. Add an MCP server first, then re-run the relevant host patch command, or manually wrap a server:
 
 ```sh
-# Example manual Claude Code MCP server wrapper.
-claude mcp add scouttrace-filesystem -- scouttrace proxy --server-name filesystem -- npx -y @modelcontextprotocol/server-filesystem "$PWD"
+# Example manual Claude Code MCP server wrapper for the current project.
+# Run this from the project directory you open with Claude Code.
+claude mcp add -s project scouttrace-filesystem -- scouttrace proxy --server-name filesystem -- npx -y @modelcontextprotocol/server-filesystem "$PWD"
 
-# Approve WebhookScout delivery once, then flush queued events when testing.
+# Or make it available to all Claude Code projects for your user.
+claude mcp add -s user scouttrace-filesystem -- scouttrace proxy --server-name filesystem -- npx -y @modelcontextprotocol/server-filesystem "$HOME"
+
+# Confirm Claude Code can see it. In the TUI, restart Claude Code if /mcp was already open.
+claude mcp list
+
+# Approve WebhookScout delivery once, then send a synthetic test event.
 scouttrace destination approve default
-scouttrace queue stats
+scouttrace preview --json | scouttrace queue inject --destination default
 scouttrace flush --destination default --yes
 ```
+
+If `scouttrace-filesystem` is not listed in Claude Code, the MCP server was added in a different scope or directory. Use `-s project` from the same project directory Claude Code shows in `/mcp`, or use `-s user` for a global server, then restart the Claude Code session.
 
 If the host config has changed since the last patch (drift detection), the command refuses to write. Pass `--force` after reviewing:
 

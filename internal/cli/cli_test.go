@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -454,6 +455,69 @@ func TestSmokeFlow(t *testing.T) {
 	}
 	if !strings.Contains(flushOut, "attempts=") {
 		t.Errorf("flush summary missing: %s", flushOut)
+	}
+}
+
+func TestWebhookScoutPreviewInjectFlushPostsMcpEvent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SCOUTTRACE_WEBHOOKSCOUT_API_KEY", "whs_cli_flush_test_key")
+	var gotPath, gotAuth string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		reader := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gz, err := gzip.NewReader(r.Body)
+			if err != nil {
+				t.Fatalf("gzip reader: %v", err)
+			}
+			defer gz.Close()
+			reader = gz
+		}
+		b, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatalf("request body not JSON: %v\n%s", err, b)
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "webhookscout", "--api-base", srv.URL, "--agent-id", "agent-cli", "--auth-header-ref", "env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY", "--hosts", "none")
+	if exit != 0 {
+		t.Fatalf("init exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	exit, _, stderr = runCLI(t, home, "destination", "approve", "default")
+	if exit != 0 {
+		t.Fatalf("destination approve exit=%d stderr=%s", exit, stderr)
+	}
+	exit, previewOut, stderr := runCLI(t, home, "preview", "--json")
+	if exit != 0 {
+		t.Fatalf("preview exit=%d stderr=%s", exit, stderr)
+	}
+	previewPath := filepath.Join(home, "preview.json")
+	if err := os.WriteFile(previewPath, []byte(previewOut), 0o600); err != nil {
+		t.Fatalf("write preview: %v", err)
+	}
+	exit, _, stderr = runCLI(t, home, "queue", "inject", "--from", previewPath, "--destination", "default")
+	if exit != 0 {
+		t.Fatalf("queue inject exit=%d stderr=%s", exit, stderr)
+	}
+	exit, flushOut, stderr := runCLI(t, home, "flush", "--destination", "default")
+	if exit != 0 {
+		t.Fatalf("flush exit=%d stdout=%s stderr=%s", exit, flushOut, stderr)
+	}
+	if gotPath != "/api/mcp/agent-cli/events" {
+		t.Fatalf("path=%q", gotPath)
+	}
+	if gotAuth != "Bearer whs_cli_flush_test_key" {
+		t.Fatalf("Authorization=%q", gotAuth)
+	}
+	if gotBody["tool"] == "" || gotBody["status"] != "ok" {
+		t.Fatalf("unexpected body: %#v", gotBody)
 	}
 }
 
