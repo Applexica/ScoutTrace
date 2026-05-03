@@ -54,18 +54,10 @@ func TestClaudeHookEstimatesCostFromTokensAndModel(t *testing.T) {
 	}
 }
 
-func TestClaudeHookFallsBackToTranscriptMetadata(t *testing.T) {
+func TestClaudeHookDoesNotMisattributeTranscriptUsageToToolEvent(t *testing.T) {
 	dir := t.TempDir()
 	transcript := filepath.Join(dir, "session.jsonl")
-	lines := []string{
-		`{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":2}}}`,
-		`{"type":"user","message":{"role":"user","content":"hi"}}`,
-		`{"type":"assistant","message":{"id":"m2","model":"claude-sonnet-4-6","usage":{"input_tokens":3000,"output_tokens":600}}}`,
-	}
-	content := ""
-	for _, l := range lines {
-		content += l + "\n"
-	}
+	content := `{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-7","usage":{"input_tokens":1,"output_tokens":214}}}` + "\n"
 	if err := os.WriteFile(transcript, []byte(content), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
 	}
@@ -74,23 +66,14 @@ func TestClaudeHookFallsBackToTranscriptMetadata(t *testing.T) {
 		"hook_event_name": "PostToolUse",
 		"transcript_path": transcript,
 		"tool_name":       "Bash",
-		"tool_response":   map[string]any{"stdout": "no metadata"},
+		"tool_response":   map[string]any{"stdout": "no billing metadata"},
 	})
 	ev, err := buildClaudeHookEvent(body, &config.Config{}, "")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if ev.Billing == nil {
-		t.Fatalf("expected billing from transcript, got nil")
-	}
-	if ev.Billing.Model != "claude-sonnet-4-6" {
-		t.Fatalf("model = %q (want last assistant model)", ev.Billing.Model)
-	}
-	if ev.Billing.TokensIn == nil || *ev.Billing.TokensIn != 3000 {
-		t.Fatalf("tokens_in = %v", ev.Billing.TokensIn)
-	}
-	if ev.Billing.PricingSource != "estimated" {
-		t.Fatalf("pricing_source = %q, want estimated", ev.Billing.PricingSource)
+	if ev.Billing != nil {
+		t.Fatalf("transcript usage/model must not be attached to individual tool event billing, got %+v", ev.Billing)
 	}
 }
 

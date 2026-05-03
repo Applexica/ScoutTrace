@@ -235,20 +235,13 @@ func buildClaudeHookEvent(body []byte, c *config.Config, hostVersion string) (*e
 }
 
 func enrichClaudeHookBilling(hp *claudeToolHookPayload, serverName, toolName string, c *config.Config) billing.Block {
-	primary := billing.Enrich(firstRaw(hp.ToolResponse, hp.ToolResult, hp.ToolOutput), serverName, toolName, staticLookup(c))
-	if hp.TranscriptPath != "" {
-		primary = billing.Merge(primary, billing.Enrich(loadClaudeTranscriptBilling(hp.TranscriptPath), serverName, toolName, nil))
-		// If transcript supplied tokens/model after primary extraction, rerun through
-		// enrichment so model pricing estimates can fill missing cost.
-		if primary.CostUSD == nil && primary.Model != "" && (primary.TokensIn != nil || primary.TokensOut != nil) {
-			raw, _ := json.Marshal(map[string]any{
-				"model": primary.Model, "provider": primary.Provider,
-				"tokens_in": primary.TokensIn, "tokens_out": primary.TokensOut,
-			})
-			primary = billing.Merge(primary, billing.Enrich(raw, serverName, toolName, nil))
-		}
-	}
-	return primary
+	// Claude Code transcript usage belongs to the assistant LLM turn, not to the
+	// individual PostToolUse event. Attaching transcript tokens to every tool
+	// event creates misleading per-tool token counts (often input_tokens=1 due to
+	// cache accounting) and inflated estimated costs. Only metadata reported by
+	// the tool response itself, or an explicit static tool price, is safe to
+	// attribute to this tool event.
+	return billing.Enrich(firstRaw(hp.ToolResponse, hp.ToolResult, hp.ToolOutput), serverName, toolName, staticLookup(c))
 }
 
 func staticLookup(c *config.Config) billing.StaticPriceLookup {
@@ -267,35 +260,6 @@ func eventBillingBlock(bb billing.Block) *event.BillingBlock {
 		Provider:      bb.Provider,
 		PricingSource: bb.PricingSource,
 	}
-}
-
-func loadClaudeTranscriptBilling(path string) json.RawMessage {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var best billing.Block
-	for _, line := range strings.Split(string(b), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		bb := billing.Extract(json.RawMessage(line))
-		var outer map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(line), &outer); err == nil {
-			if msg, ok := outer["message"]; ok {
-				bb = billing.Merge(billing.Extract(msg), bb)
-			}
-		}
-		if !bb.Empty() {
-			best = billing.Merge(bb, best)
-		}
-	}
-	raw, _ := json.Marshal(map[string]any{
-		"cost_usd": best.CostUSD, "tokens_in": best.TokensIn, "tokens_out": best.TokensOut,
-		"model": best.Model, "provider": best.Provider,
-	})
-	return raw
 }
 
 func splitClaudeToolName(name string) (server string, tool string) {
