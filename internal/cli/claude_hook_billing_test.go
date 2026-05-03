@@ -19,7 +19,7 @@ func TestClaudeHookBuildsBillingFromToolResponse(t *testing.T) {
 		"tool_input":{"prompt":"hi"},
 		"tool_response":{"cost_usd":0.05,"tokens_in":1000,"tokens_out":500,"model":"claude-sonnet-4-6"}
 	}`)
-	ev, err := buildClaudeHookEvent(body, &config.Config{}, "")
+	ev, err := buildClaudeHookEvent(body, &config.Config{}, "", "")
 	if err != nil {
 		t.Fatalf("buildClaudeHookEvent: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestClaudeHookEstimatesCostFromTokensAndModel(t *testing.T) {
 		"tool_name":"mcp__llm__complete",
 		"tool_response":{"usage":{"input_tokens":2000,"output_tokens":1000},"model":"claude-haiku-4-5"}
 	}`)
-	ev, err := buildClaudeHookEvent(body, &config.Config{}, "")
+	ev, err := buildClaudeHookEvent(body, &config.Config{}, "", "")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestClaudeHookDoesNotMisattributeTranscriptUsageToToolEvent(t *testing.T) {
 		"tool_name":       "Bash",
 		"tool_response":   map[string]any{"stdout": "no billing metadata"},
 	})
-	ev, err := buildClaudeHookEvent(body, &config.Config{}, "")
+	ev, err := buildClaudeHookEvent(body, &config.Config{}, "", "")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestClaudeHookTranscriptDoesNotCapturePromptText(t *testing.T) {
 		"tool_name":       "Bash",
 		"tool_response":   map[string]any{"stdout": "ok"},
 	})
-	ev, err := buildClaudeHookEvent(body, &config.Config{}, "")
+	ev, err := buildClaudeHookEvent(body, &config.Config{}, "", "")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -511,7 +511,7 @@ func TestClaudeHookStaticToolPriceFillsMissingCost(t *testing.T) {
 		"tool_input":{"selector":"#go"},
 		"tool_response":{"content":[{"type":"text","text":"clicked"}]}
 	}`)
-	ev, err := buildClaudeHookEvent(body, cfg, "")
+	ev, err := buildClaudeHookEvent(body, cfg, "", "")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}

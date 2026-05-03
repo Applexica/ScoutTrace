@@ -4,8 +4,9 @@
 // the static estimate baked into internal/billing's table — without ever
 // blocking event capture if the live source is unreachable.
 //
-// All implementations cache lookups in-process for a configured TTL and must
-// honor the caller's context for timeout/cancellation. A failed lookup
+// Implementations cache lookups in-process for a configured TTL and can also
+// persist the same entries to disk when configured. They must honor the
+// caller's context for timeout/cancellation. A failed lookup
 // (network error, parse error, missing model) returns ok=false; callers fall
 // back to the static estimate. Negative results are also cached so we do not
 // hammer the upstream API for a model it does not know.
@@ -55,8 +56,8 @@ type cacheEntry struct {
 
 // memoryCache is an unbounded in-memory cache keyed by (provider, model).
 // "Unbounded" is fine for ScoutTrace because the per-process model set is
-// small (typically <10 distinct models per session); the cache lives only for
-// the lifetime of the proxy or hook invocation.
+// small (typically <10 distinct models per session). When a disk cache is
+// configured, this remains the fast first-level cache for the current process.
 type memoryCache struct {
 	mu  sync.Mutex
 	ttl time.Duration
@@ -82,13 +83,23 @@ func (c *memoryCache) get(key string) (cacheEntry, bool) {
 	return e, true
 }
 
-func (c *memoryCache) set(key string, e cacheEntry) {
+func (c *memoryCache) set(key string, e cacheEntry) cacheEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.ttl <= 0 {
-		return
+		return cacheEntry{}
 	}
 	e.expires = c.now().Add(c.ttl)
+	c.m[key] = e
+	return e
+}
+
+func (c *memoryCache) setEntry(key string, e cacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ttl <= 0 || e.expires.IsZero() {
+		return
+	}
 	c.m[key] = e
 }
 

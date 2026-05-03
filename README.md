@@ -1242,7 +1242,7 @@ scouttrace config set queue.path /var/lib/scouttrace/queue
 
 #### Live LLM pricing
 
-ScoutTrace enables live model pricing by default for parsed configs. When an event has model + token metadata and no upstream-reported dollar cost, ScoutTrace queries PricePerToken's no-auth MCP-over-HTTP endpoint, caches the model price in-process, and marks the event with `pricing_source: "pricepertoken"`. If the lookup times out, is offline, or does not know the model, ScoutTrace falls back to the built-in static estimate and keeps capturing.
+ScoutTrace enables live model pricing by default for parsed configs. When an event has model + token metadata and no upstream-reported dollar cost, ScoutTrace queries PricePerToken's no-auth MCP-over-HTTP endpoint, caches the model price in memory and on disk under `~/.scouttrace/cache/live-pricing/pricepertoken.json`, and marks the event with `pricing_source: "pricepertoken"`. The default 24-hour TTL is shared across short-lived Claude hook invocations as well as long-running MCP proxy sessions. If the lookup times out, is offline, or does not know the model, ScoutTrace falls back to the built-in static estimate and keeps capturing.
 
 ```json
 {

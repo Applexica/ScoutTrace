@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -20,18 +22,20 @@ const DefaultPricePerTokenURL = "https://api.pricepertoken.com/mcp/mcp"
 // `get_model`. Failures (network, non-2xx, parse, missing fields) are returned
 // as ok=false so callers fall back to the static table.
 type PricePerToken struct {
-	URL     string
-	Timeout time.Duration
-	Client  *http.Client
-	cache   *memoryCache
+	URL       string
+	Timeout   time.Duration
+	Client    *http.Client
+	CachePath string
+	cache     *memoryCache
 }
 
 // PricePerTokenOptions configures a PricePerToken provider.
 type PricePerTokenOptions struct {
-	URL      string        // overrides DefaultPricePerTokenURL when non-empty
-	Timeout  time.Duration // per-request HTTP timeout; 0 → 1500ms
-	CacheTTL time.Duration // in-process cache TTL; 0 disables caching
-	Client   *http.Client  // overrides the default client when non-nil
+	URL       string        // overrides DefaultPricePerTokenURL when non-empty
+	Timeout   time.Duration // per-request HTTP timeout; 0 → 1500ms
+	CacheTTL  time.Duration // in-process cache TTL; 0 disables caching
+	CachePath string        // optional persistent JSON cache path shared across processes
+	Client    *http.Client  // overrides the default client when non-nil
 }
 
 // NewPricePerToken builds a Provider with conservative defaults. Callers are
@@ -51,10 +55,11 @@ func NewPricePerToken(opts PricePerTokenOptions) *PricePerToken {
 		client = &http.Client{Timeout: timeout}
 	}
 	return &PricePerToken{
-		URL:     url,
-		Timeout: timeout,
-		Client:  client,
-		cache:   newMemoryCache(opts.CacheTTL),
+		URL:       url,
+		Timeout:   timeout,
+		Client:    client,
+		CachePath: opts.CachePath,
+		cache:     newMemoryCache(opts.CacheTTL),
 	}
 }
 
@@ -78,10 +83,97 @@ func (p *PricePerToken) Lookup(ctx context.Context, provider, model string) (Pri
 	if e, ok := p.cache.get(key); ok {
 		return e.pricing, e.ok
 	}
+	if e, ok := p.diskGet(key); ok {
+		p.cache.setEntry(key, e)
+		return e.pricing, e.ok
+	}
 
 	pricing, ok := p.fetch(ctx, provider, model)
-	p.cache.set(key, cacheEntry{pricing: pricing, ok: ok})
+	e := p.cache.set(key, cacheEntry{pricing: pricing, ok: ok})
+	p.diskSet(key, e)
 	return pricing, ok
+}
+
+type diskCacheFile struct {
+	Version int                       `json:"version"`
+	Entries map[string]diskCacheEntry `json:"entries"`
+}
+
+type diskCacheEntry struct {
+	Pricing Pricing   `json:"pricing"`
+	OK      bool      `json:"ok"`
+	Expires time.Time `json:"expires"`
+}
+
+func (p *PricePerToken) diskGet(key string) (cacheEntry, bool) {
+	if p == nil || strings.TrimSpace(p.CachePath) == "" {
+		return cacheEntry{}, false
+	}
+	f, ok := p.readDiskCache()
+	if !ok || f.Entries == nil {
+		return cacheEntry{}, false
+	}
+	de, ok := f.Entries[key]
+	if !ok || time.Now().After(de.Expires) {
+		return cacheEntry{}, false
+	}
+	return cacheEntry{pricing: de.Pricing, ok: de.OK, expires: de.Expires}, true
+}
+
+func (p *PricePerToken) diskSet(key string, e cacheEntry) {
+	if p == nil || strings.TrimSpace(p.CachePath) == "" || e.expires.IsZero() {
+		return
+	}
+	f, _ := p.readDiskCache()
+	if f.Entries == nil {
+		f.Entries = map[string]diskCacheEntry{}
+	}
+	f.Version = 1
+	now := time.Now()
+	for k, v := range f.Entries {
+		if now.After(v.Expires) {
+			delete(f.Entries, k)
+		}
+	}
+	f.Entries[key] = diskCacheEntry{Pricing: e.pricing, OK: e.ok, Expires: e.expires}
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(p.CachePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(p.CachePath)+"-tmp-")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	_, writeErr := tmp.Write(b)
+	closeErr := tmp.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	_ = os.Chmod(tmpName, 0o600)
+	if err := os.Rename(tmpName, p.CachePath); err != nil {
+		_ = os.Remove(tmpName)
+	}
+}
+
+func (p *PricePerToken) readDiskCache() (diskCacheFile, bool) {
+	if p == nil || strings.TrimSpace(p.CachePath) == "" {
+		return diskCacheFile{}, false
+	}
+	b, err := os.ReadFile(p.CachePath)
+	if err != nil {
+		return diskCacheFile{}, false
+	}
+	var f diskCacheFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		return diskCacheFile{}, false
+	}
+	return f, true
 }
 
 // fetch issues a single JSON-RPC request against the configured endpoint.

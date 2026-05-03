@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/webhookscout/scouttrace/internal/billing"
 	"github.com/webhookscout/scouttrace/internal/config"
 	"github.com/webhookscout/scouttrace/internal/dispatch"
 	"github.com/webhookscout/scouttrace/internal/event"
@@ -89,7 +90,13 @@ func CmdProxy(ctx context.Context, g *Globals, args []string) int {
 			maxArg = c.Capture.MaxArgBytes
 			maxRes = c.Capture.MaxResultBytes
 		}
-		live, liveSource := c.LiveLookup()
+		var live billing.LiveLookup
+		var liveSource string
+		var staticPrices billing.StaticPriceLookup
+		if c != nil {
+			live, liveSource = c.LiveLookupWithHome(g.Home)
+			staticPrices = c.StaticPriceLookup()
+		}
 		worker = proxy.NewCaptureWorker(proxy.CaptureWorker{
 			Session:        sess,
 			Engine:         eng,
@@ -100,7 +107,7 @@ func CmdProxy(ctx context.Context, g *Globals, args []string) int {
 			ScoutVersion:   "0.1.0",
 			MaxArgBytes:    maxArg,
 			MaxResultBytes: maxRes,
-			StaticPrices:   c.StaticPriceLookup(),
+			StaticPrices:   staticPrices,
 			LivePrices:     live,
 			LiveSource:     liveSource,
 		})

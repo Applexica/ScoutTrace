@@ -66,6 +66,39 @@ func TestPricePerTokenLookupFetchesAndCachesModelPricing(t *testing.T) {
 	}
 }
 
+func TestPricePerTokenLookupPersistsCacheAcrossProviderInstances(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"result": map[string]any{
+				"structuredContent": map[string]any{
+					"result": `{"author":"anthropic","model":"claude-sonnet-4.6","pricing":{"input_per_1m":3,"output_per_1m":15,"cache_read_per_1m":0.3,"cache_write_per_1m":3.75}}`,
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	cachePath := t.TempDir() + "/pricepertoken-cache.json"
+	p1 := NewPricePerToken(PricePerTokenOptions{URL: srv.URL, CacheTTL: time.Hour, CachePath: cachePath})
+	got, ok := p1.Lookup(context.Background(), "anthropic", "claude-sonnet-4-6")
+	if !ok {
+		t.Fatalf("initial Lookup ok=false")
+	}
+
+	p2 := NewPricePerToken(PricePerTokenOptions{URL: "http://127.0.0.1:1/unreachable", Timeout: 10 * time.Millisecond, CacheTTL: time.Hour, CachePath: cachePath})
+	got2, ok := p2.Lookup(context.Background(), "anthropic", "claude-sonnet-4-6")
+	if !ok || got2 != got {
+		t.Fatalf("disk cached lookup = %#v, %v; want %#v, true", got2, ok, got)
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("calls = %d, want exactly one upstream call", calls)
+	}
+}
+
 func TestPricePerTokenLookupCachesNegativeResults(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

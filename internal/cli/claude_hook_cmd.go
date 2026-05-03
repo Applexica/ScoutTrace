@@ -107,7 +107,7 @@ func claudeHookPostToolUse(ctx context.Context, g *Globals, args []string) int {
 		}
 		return 0
 	}
-	env, err := buildClaudeHookEvent(body, c, *hostVersion)
+	env, err := buildClaudeHookEvent(body, c, *hostVersion, g.Home)
 	if err != nil {
 		fmt.Fprintln(g.Stderr, "claude-hook:", err)
 		if *failClosed {
@@ -366,7 +366,7 @@ func buildClaudeLLMTurnEvents(transcriptPath, hookSessionID string, c *config.Co
 		sessionID = event.NewULID()
 	}
 
-	live, liveSource := liveLookup(c)
+	live, liveSource := liveLookup(c, scoutHome)
 	out := make([]*event.ToolCallEvent, 0, len(turns))
 	for _, t := range turns {
 		now := time.Now().UTC()
@@ -768,7 +768,7 @@ func writeClaudeTranscriptCursor(path string, cur claudeTranscriptCursor) error 
 	return os.WriteFile(path, b, 0o600)
 }
 
-func buildClaudeHookEvent(body []byte, c *config.Config, hostVersion string) (*event.ToolCallEvent, error) {
+func buildClaudeHookEvent(body []byte, c *config.Config, hostVersion, scoutHome string) (*event.ToolCallEvent, error) {
 	var hp claudeToolHookPayload
 	if err := json.Unmarshal(body, &hp); err != nil {
 		return nil, fmt.Errorf("invalid Claude Code hook JSON: %w", err)
@@ -809,7 +809,7 @@ func buildClaudeHookEvent(body []byte, c *config.Config, hostVersion string) (*e
 		},
 		Timing: event.TimingBlock{StartedAt: now, EndedAt: now, LatencyMS: 0},
 	}
-	if bb := enrichClaudeHookBilling(&hp, serverName, toolName, c); !bb.Empty() {
+	if bb := enrichClaudeHookBilling(&hp, serverName, toolName, c, scoutHome); !bb.Empty() {
 		ev.Billing = eventBillingBlock(bb)
 	}
 
@@ -870,14 +870,14 @@ func finalizeWithRedaction(ev *event.ToolCallEvent, c *config.Config) (*event.To
 	return &out, nil
 }
 
-func enrichClaudeHookBilling(hp *claudeToolHookPayload, serverName, toolName string, c *config.Config) billing.Block {
+func enrichClaudeHookBilling(hp *claudeToolHookPayload, serverName, toolName string, c *config.Config, scoutHome string) billing.Block {
 	// Claude Code transcript usage belongs to the assistant LLM turn, not to the
 	// individual PostToolUse event. Attaching transcript tokens to every tool
 	// event creates misleading per-tool token counts (often input_tokens=1 due to
 	// cache accounting) and inflated estimated costs. Only metadata reported by
 	// the tool response itself, or an explicit static tool price, is safe to
 	// attribute to this tool event.
-	live, liveSource := liveLookup(c)
+	live, liveSource := liveLookup(c, scoutHome)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return billing.EnrichLive(ctx, firstRaw(hp.ToolResponse, hp.ToolResult, hp.ToolOutput), serverName, toolName, staticLookup(c), live, liveSource)
@@ -894,11 +894,11 @@ func staticLookup(c *config.Config) billing.StaticPriceLookup {
 // for use inside the Claude hook capture path. A nil lookup means live pricing
 // is disabled (or no config was loaded) and callers should fall back to the
 // static estimate exactly as before.
-func liveLookup(c *config.Config) (billing.LiveLookup, string) {
+func liveLookup(c *config.Config, scoutHome string) (billing.LiveLookup, string) {
 	if c == nil {
 		return nil, ""
 	}
-	return c.LiveLookup()
+	return c.LiveLookupWithHome(scoutHome)
 }
 
 func eventBillingBlock(bb billing.Block) *event.BillingBlock {

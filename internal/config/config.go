@@ -385,10 +385,18 @@ func (c *Config) StaticPriceLookup() billing.StaticPriceLookup {
 // pricing provider, plus the source identifier to record when a live hit
 // occurs. Returns nil, "" when live pricing is disabled or unconfigured.
 //
-// The returned lookup wraps the provider so tests can swap in a fake without
-// the rest of capture caring which backend is in use. The provider's own
-// cache memoizes per-process model lookups.
+// LiveLookup returns the configured live-pricing lookup and its source name so
+// the rest of capture does not need to care which backend is in use. This
+// compatibility wrapper uses in-process caching only; CLI paths should prefer
+// LiveLookupWithHome so hook/proxy invocations share the persistent disk cache.
 func (c *Config) LiveLookup() (billing.LiveLookup, string) {
+	return c.LiveLookupWithHome("")
+}
+
+// LiveLookupWithHome returns the configured live-pricing lookup using home for
+// the optional persistent disk cache. When home is empty, the provider still
+// uses its in-process cache and remains network-best-effort.
+func (c *Config) LiveLookupWithHome(home string) (billing.LiveLookup, string) {
 	if c == nil {
 		return nil, ""
 	}
@@ -403,10 +411,15 @@ func (c *Config) LiveLookup() (billing.LiveLookup, string) {
 		if ttl == 0 {
 			ttl = 24 * time.Hour
 		}
+		cachePath := ""
+		if strings.TrimSpace(home) != "" {
+			cachePath = filepath.Join(home, "cache", "live-pricing", "pricepertoken.json")
+		}
 		p := livepricing.NewPricePerToken(livepricing.PricePerTokenOptions{
-			URL:      lp.URL,
-			Timeout:  timeout,
-			CacheTTL: ttl,
+			URL:       lp.URL,
+			Timeout:   timeout,
+			CacheTTL:  ttl,
+			CachePath: cachePath,
 		})
 		return wrapLiveProvider(p), p.Name()
 	default:
