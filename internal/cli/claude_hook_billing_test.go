@@ -661,6 +661,78 @@ func TestClaudeHookLLMTurnTokensAreIncrementalNotCumulative(t *testing.T) {
 	}
 }
 
+func TestClaudeHookLLMTurnDedupesRepeatedAssistantTranscriptRows(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+
+	first := `{"type":"assistant","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":67999,"cache_read_input_tokens":0,"output_tokens":42}}}` + "\n"
+	duplicate := `{"type":"assistant","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":67999,"cache_read_input_tokens":0,"output_tokens":42}}}` + "\n"
+	second := `{"type":"assistant","requestId":"req_2","message":{"id":"msg_2","model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":500,"cache_read_input_tokens":67999,"output_tokens":17}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(first), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	events1, err := buildClaudeLLMTurnEvents(transcript, "sess", &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if len(events1) != 1 {
+		t.Fatalf("first scan len = %d, want 1", len(events1))
+	}
+	if events1[0].Billing == nil || events1[0].Billing.TokensIn == nil || *events1[0].Billing.TokensIn != 68000 {
+		t.Fatalf("first scan tokens_in = %+v, want 68000", events1[0].Billing)
+	}
+
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("append open: %v", err)
+	}
+	if _, err := f.WriteString(duplicate + second); err != nil {
+		t.Fatalf("append write: %v", err)
+	}
+	_ = f.Close()
+
+	events2, err := buildClaudeLLMTurnEvents(transcript, "sess", &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if len(events2) != 1 {
+		t.Fatalf("second scan len = %d, want 1 (duplicate assistant row skipped)", len(events2))
+	}
+	if events2[0].Billing == nil || events2[0].Billing.TokensIn == nil || *events2[0].Billing.TokensIn != 500 {
+		t.Fatalf("second scan tokens_in = %+v, want 500 not repeated 68000", events2[0].Billing)
+	}
+	if events2[0].Billing.TokensOut == nil || *events2[0].Billing.TokensOut != 17 {
+		t.Fatalf("second scan tokens_out = %+v, want 17", events2[0].Billing)
+	}
+}
+
+func TestClaudeHookLLMTurnEqualEffectiveInputDoesNotRebillFullContext(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+
+	content := `{"type":"assistant","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":999,"output_tokens":42}}}` + "\n" +
+		`{"type":"assistant","requestId":"req_2","message":{"id":"msg_2","model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":999,"output_tokens":17}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(content), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	events, err := buildClaudeLLMTurnEvents(transcript, "sess", &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("buildClaudeLLMTurnEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2", len(events))
+	}
+	if events[1].Billing == nil || events[1].Billing.TokensIn == nil || *events[1].Billing.TokensIn != 0 {
+		t.Fatalf("second equal-effective-input tokens_in = %+v, want 0 not repeated 1000", events[1].Billing)
+	}
+	if events[1].Billing.TokensOut == nil || *events[1].Billing.TokensOut != 17 {
+		t.Fatalf("second tokens_out = %+v, want 17", events[1].Billing)
+	}
+}
+
 // TestClaudeHookCursorBackwardCompatLegacyIntegerOffset verifies that a
 // cursor file written by v0.1.11 (a bare decimal byte offset) is still
 // honored after upgrading to the JSON {offset, prior_effective_in} shape.

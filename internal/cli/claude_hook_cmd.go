@@ -438,8 +438,9 @@ type claudeStopTurn struct {
 // the most recent assistant line we have already emitted; it is the baseline
 // the next scan subtracts from to compute an incremental tokens_in.
 type claudeTranscriptCursor struct {
-	Offset           int64 `json:"offset"`
-	PriorEffectiveIn int   `json:"prior_effective_in"`
+	Offset           int64    `json:"offset"`
+	PriorEffectiveIn int      `json:"prior_effective_in"`
+	SeenMessageKeys  []string `json:"seen_message_keys,omitempty"`
 }
 
 // readNewAssistantUsageLines scans the transcript starting at start.Offset and
@@ -479,6 +480,14 @@ func readNewAssistantUsageLines(path string, start claudeTranscriptCursor) ([]cl
 	r := bufio.NewReader(f)
 	end.Offset = start.Offset
 	runningEffectiveIn := start.PriorEffectiveIn
+	seenMessageKeys := map[string]bool{}
+	end.SeenMessageKeys = nil
+	for _, key := range start.SeenMessageKeys {
+		if key != "" {
+			seenMessageKeys[key] = true
+			end.SeenMessageKeys = appendSeenClaudeMessageKey(end.SeenMessageKeys, key)
+		}
+	}
 	var out []claudeStopTurn
 	for {
 		line, err := r.ReadBytes('\n')
@@ -495,8 +504,10 @@ func readNewAssistantUsageLines(path string, start claudeTranscriptCursor) ([]cl
 			continue
 		}
 		var entry struct {
-			Type    string `json:"type"`
-			Message struct {
+			Type      string `json:"type"`
+			RequestID string `json:"requestId"`
+			Message   struct {
+				ID    string          `json:"id"`
 				Model string          `json:"model"`
 				Usage json.RawMessage `json:"usage"`
 			} `json:"message"`
@@ -511,14 +522,34 @@ func readNewAssistantUsageLines(path string, start claudeTranscriptCursor) ([]cl
 			continue
 		}
 		effIn, outTokens := transcriptUsageTokens(entry.Message.Usage)
+		messageKey := claudeAssistantMessageKey(entry.Message.ID, entry.RequestID)
+		if messageKey != "" && seenMessageKeys[messageKey] {
+			// Claude Code can append the same assistant message multiple times as
+			// the transcript is updated around tool execution. Those rows have the
+			// same message/request id and usage; emitting them again would double-bill
+			// output tokens and, before this guard, could re-charge the full cached
+			// context as tokens_in.
+			continue
+		}
 		var delta int
 		if effIn > runningEffectiveIn {
 			delta = effIn - runningEffectiveIn
+		} else if effIn == runningEffectiveIn {
+			// Same effective context size as the previous emitted assistant turn.
+			// This can be a legitimate distinct API call with only output tokens to
+			// charge, or a duplicate already caught above. Never treat equal as a
+			// context reset; doing so re-bills the full context and causes 60k+
+			// token spikes between small deltas.
+			delta = 0
 		} else {
 			// Context shrank or reset — bill only the current turn's tokens.
 			delta = effIn
 		}
 		runningEffectiveIn = effIn
+		if messageKey != "" {
+			seenMessageKeys[messageKey] = true
+			end.SeenMessageKeys = appendSeenClaudeMessageKey(end.SeenMessageKeys, messageKey)
+		}
 		out = append(out, claudeStopTurn{
 			Model:         entry.Message.Model,
 			TokensInDelta: delta,
@@ -573,6 +604,33 @@ func jsonNumberToInt(v any) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func claudeAssistantMessageKey(messageID, requestID string) string {
+	if messageID != "" {
+		return "message:" + messageID
+	}
+	if requestID != "" {
+		return "request:" + requestID
+	}
+	return ""
+}
+
+func appendSeenClaudeMessageKey(keys []string, key string) []string {
+	if key == "" {
+		return keys
+	}
+	for _, existing := range keys {
+		if existing == key {
+			return keys
+		}
+	}
+	keys = append(keys, key)
+	const maxSeenClaudeMessageKeys = 1024
+	if len(keys) > maxSeenClaudeMessageKeys {
+		keys = keys[len(keys)-maxSeenClaudeMessageKeys:]
+	}
+	return keys
 }
 
 // claudeTranscriptCursorPath derives a deterministic file path for the
