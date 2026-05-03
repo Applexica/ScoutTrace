@@ -260,7 +260,9 @@ scouttrace doctor
 For WebhookScout, use a WebhookScout API key plus the agent ID shown/created in the WebhookScout portal:
 
 ```sh
-export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='***'
+# Set an environment variable that holds the WebhookScout API key.
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='REPLACE_WITH_WEBHOOKSCOUT_API_KEY'
+
 scouttrace init \
   --destination webhookscout \
   --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
@@ -269,8 +271,54 @@ scouttrace init \
 scouttrace doctor
 ```
 
+> **`env://NAME` references an environment variable name, not the secret itself.** The text after `env://` is the *name* of an environment variable that ScoutTrace reads at delivery time. Do not paste the raw `whs_...` token there — `--auth-header-ref` will be stored verbatim in `config.yaml`, and a token pasted directly will end up referenced as if it were a variable name.
+>
+> ```sh
+> # Wrong — the raw token is treated as if it were a variable name.
+> --auth-header-ref env://whs_live_xxxxxxxxxxxxxxxx
+>
+> # Right — point to an environment variable that holds the token.
+> export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='REPLACE_WITH_WEBHOOKSCOUT_API_KEY'
+> --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY
+> ```
+
 > Do not paste API keys into MCP host config files. ScoutTrace config stores credential references such as `env://...`, `keychain://...`, or `encfile://...`, not raw secrets. In the interactive wizard you may paste the WebhookScout API key at the credential prompt; ScoutTrace stores it securely and writes only a credential reference.
 
+### Hermes: known-good delivery setup and verification
+
+Use this block to bring up an isolated ScoutTrace home for Hermes and confirm that envelopes can be redacted, queued, and delivered to WebhookScout. **It verifies delivery only**: it does not capture live MCP traffic, because `--hosts none` skips host patching, and Hermes itself spawns no MCP servers under the proxy until you patch its config (see below). Live capture requires either a successful `scouttrace hosts patch --host hermes` or MCP servers wrapped manually with `scouttrace proxy -- ...`.
+
+```sh
+# 1. Provide the WebhookScout API key as an environment variable.
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='REPLACE_WITH_WEBHOOKSCOUT_API_KEY'
+
+# 2. Initialize an isolated Hermes home with delivery configured but no host patching.
+scouttrace --home ~/.scouttrace-hermes init \
+  --destination webhookscout \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --agent-id <webhookscout-agent-id> \
+  --hosts none \
+  --yes
+
+# 3. Approve the default destination so ScoutTrace will send to WebhookScout.
+scouttrace --home ~/.scouttrace-hermes destination approve default
+
+# 4. Validate config, queue, and destination adapter without sending anything.
+scouttrace --home ~/.scouttrace-hermes doctor
+
+# 5. Synthesize a redacted envelope, enqueue it, and drain the queue once.
+scouttrace --home ~/.scouttrace-hermes preview --json \
+  | scouttrace --home ~/.scouttrace-hermes queue inject --destination default
+scouttrace --home ~/.scouttrace-hermes flush --destination default --yes
+```
+
+If `flush` reports the synthetic envelope was delivered, the WebhookScout pipeline (credentials, approval, destination adapter, queue) is healthy end-to-end. To then capture real Hermes tool activity, register Hermes' MCP servers under the proxy:
+
+```sh
+scouttrace --home ~/.scouttrace-hermes hosts patch --host hermes
+```
+
+If that command exits with `hosts: "mcp_servers" key absent`, Hermes' config (`~/.hermes/config.yaml`) does not yet declare any MCP servers, so there is nothing for ScoutTrace to wrap. Add at least one `mcp_servers.<name>` entry to the Hermes config (or have Hermes itself add one), then re-run `hosts patch`. The error is the patcher refusing to invent server entries — ScoutTrace only rewrites servers that already exist.
 
 ### Generate a WebhookScout setup command from the Agent UI
 
@@ -291,13 +339,13 @@ The safest way to configure ScoutTrace for WebhookScout is to let WebhookScout g
 WebhookScout generates commands with the selected agent ID and API ID already filled in. It should not display raw API keys in the command. If you choose environment-variable credential storage, the command uses a placeholder such as:
 
 ```sh
-export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='<paste API key here>'
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='REPLACE_WITH_WEBHOOKSCOUT_API_KEY'
 ```
 
 Example generated command block for a Codex setup with isolated ScoutTrace home:
 
 ```sh
-export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='<paste API key here>'
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='REPLACE_WITH_WEBHOOKSCOUT_API_KEY'
 
 scouttrace --home ~/.scouttrace-codex init \
   --destination webhookscout \
@@ -446,7 +494,7 @@ The examples below show the same ScoutTrace command family for five common AI co
 Shared variables used by several examples:
 
 ```sh
-export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='***'
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='REPLACE_WITH_WEBHOOKSCOUT_API_KEY'
 export WEBHOOKSCOUT_AGENT_ID='<webhookscout-agent-id>'
 ```
 
@@ -1048,7 +1096,7 @@ scouttrace init --hosts claude-desktop,cursor --destination stdout --yes
 WebhookScout setup with an API key and agent ID from the WebhookScout portal:
 
 ```sh
-export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='***'   # populate locally; never commit
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='REPLACE_WITH_WEBHOOKSCOUT_API_KEY'   # populate locally; never commit
 scouttrace init \
   --destination webhookscout \
   --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
@@ -1062,7 +1110,7 @@ If your WebhookScout portal provides a short-lived setup token, ScoutTrace can e
 Custom HTTP webhook with a credential reference:
 
 ```sh
-export MY_WEBHOOK_TOKEN='***'
+export MY_WEBHOOK_TOKEN='REPLACE_WITH_WEBHOOK_TOKEN'
 scouttrace init \
   --destination https://hooks.example.internal/scouttrace \
   --auth-header-ref env://MY_WEBHOOK_TOKEN \
@@ -1398,6 +1446,16 @@ scouttrace destination list
 scouttrace doctor
 scouttrace queue flush --destination default --yes   # one drain pass with auto-approve
 ```
+
+Delivery-vs-capture checklist for WebhookScout setups:
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `doctor` reports `creds: ref not found` | `env://...` points to a missing environment variable, or the raw `whs_...` token was pasted after `env://` instead of a variable name. | Export the token into a variable such as `SCOUTTRACE_WEBHOOKSCOUT_API_KEY`, then set `--auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY`. |
+| `destination list` shows `approved=false` | ScoutTrace blocks first network egress until the target host is approved. | Run `scouttrace destination approve default` for the matching `--home`, or `destination approve-host webhookscout api.webhookscout.com`. |
+| Synthetic `preview | queue inject` plus `flush` succeeds, but no live events appear | Delivery works, but capture is not installed for the host or no tool traffic is passing through `scouttrace proxy`. | Patch the relevant host config or wrap MCP servers manually with `scouttrace proxy -- ...`, then restart/reload the host. |
+| `scouttrace --home ~/.scouttrace-hermes hosts patch --host hermes` prints `hosts: "mcp_servers" key absent` | Hermes has no top-level `mcp_servers` entries for ScoutTrace to wrap. | Add/configure Hermes MCP servers first, then re-run `hosts patch --host hermes`. |
+| Queued events remain pending while the host is closed | No in-proxy dispatcher or sidecar is draining the queue. | Run `scouttrace --home <home> start --yes` as a dispatcher sidecar, or use `flush --destination default --yes` for a one-shot drain. |
 
 A redaction policy you're unsure about — preview, then lint, then test:
 
