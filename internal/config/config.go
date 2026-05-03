@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/webhookscout/scouttrace/internal/billing"
 )
 
 // Config is the top-level user config.
@@ -26,7 +28,25 @@ type Config struct {
 	Queue              QueueConfig         `json:"queue,omitempty"`
 	Redaction          RedactionConfig     `json:"redaction,omitempty"`
 	Capture            CaptureConfig       `json:"capture,omitempty"`
+	Cost               CostConfig          `json:"cost,omitempty"`
 	SelfTelemetry      SelfTelemetryConfig `json:"self_telemetry,omitempty"`
+}
+
+// CostConfig groups cost/billing knobs.
+type CostConfig struct {
+	ToolPrices []ToolPriceEntry `json:"tool_prices,omitempty"`
+}
+
+// ToolPriceEntry configures a static per-tool cost. The first entry whose
+// (ServerGlob, ToolGlob) matches a captured event's (server, tool) wins;
+// the configured CostUSD is then applied with PricingSource="static" when
+// no upstream-reported or estimated cost was available.
+type ToolPriceEntry struct {
+	ServerGlob string  `json:"server_glob"`
+	ToolGlob   string  `json:"tool_glob"`
+	CostUSD    float64 `json:"cost_usd"`
+	Provider   string  `json:"provider,omitempty"`
+	Model      string  `json:"model,omitempty"`
 }
 
 // HostRef carries patch bookkeeping for a host.
@@ -275,7 +295,39 @@ func (c *Config) Validate() error {
 	if c.Capture.MaxResultBytes > 16*1024*1024 {
 		return newErr(ErrCodeConfigParse, "capture.max_result_bytes > 16 MiB cap")
 	}
+	for i, p := range c.Cost.ToolPrices {
+		if p.ServerGlob == "" || p.ToolGlob == "" {
+			return newErr(ErrCodeConfigParse, fmt.Sprintf("cost.tool_prices[%d]: server_glob and tool_glob required", i))
+		}
+		if p.CostUSD < 0 {
+			return newErr(ErrCodeConfigParse, fmt.Sprintf("cost.tool_prices[%d]: cost_usd must be >= 0", i))
+		}
+	}
 	return nil
+}
+
+// StaticPriceLookup returns a billing lookup function backed by cost.tool_prices.
+// The first matching rule wins. Glob syntax follows filepath.Match; invalid
+// globs fall back to exact matching so a malformed optional rule cannot panic.
+func (c *Config) StaticPriceLookup() billing.StaticPriceLookup {
+	if c == nil || len(c.Cost.ToolPrices) == 0 {
+		return nil
+	}
+	return func(serverName, toolName string) (billing.StaticPrice, bool) {
+		for _, p := range c.Cost.ToolPrices {
+			if globMatch(p.ServerGlob, serverName) && globMatch(p.ToolGlob, toolName) {
+				return billing.StaticPrice{CostUSD: p.CostUSD, Provider: p.Provider, Model: p.Model}, true
+			}
+		}
+		return billing.StaticPrice{}, false
+	}
+}
+
+func globMatch(pattern, value string) bool {
+	if ok, err := filepath.Match(pattern, value); err == nil {
+		return ok
+	}
+	return pattern == value
 }
 
 func validateDest(d DestinationEntry) error {

@@ -97,6 +97,115 @@ func TestWebhookScoutPostsToMcpEventsEndpointWithBearerKey(t *testing.T) {
 	}
 }
 
+func TestWebhookScoutMapsBillingFieldsWhenPresent(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reader io.Reader = r.Body
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gz, err := gzip.NewReader(r.Body)
+			if err != nil {
+				t.Fatalf("gzip: %v", err)
+			}
+			defer gz.Close()
+			reader = gz
+		}
+		b, _ := io.ReadAll(reader)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	a, err := New(Config{Name: "default", APIBase: srv.URL, AgentID: "agent-1"}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cost := 0.0123
+	tokIn := 1500
+	tokOut := 300
+	ev := event.ToolCallEvent{
+		ID:         "evt_b",
+		Schema:     event.SchemaVersion,
+		CapturedAt: time.Now().UTC(),
+		SessionID:  "sess_b",
+		Source:     event.SourceBlock{Kind: "claude_code_hook", ScoutTraceVersion: "test"},
+		Server:     event.ServerBlock{Name: "anthropic"},
+		Tool:       event.ToolBlock{Name: "messages.create"},
+		Response:   event.ResponseBlock{OK: true, Result: json.RawMessage(`{}`)},
+		Timing:     event.TimingBlock{LatencyMS: 5},
+		Billing: &event.BillingBlock{
+			CostUSD:       &cost,
+			TokensIn:      &tokIn,
+			TokensOut:     &tokOut,
+			Model:         "claude-sonnet-4-6",
+			Provider:      "anthropic",
+			PricingSource: "reported",
+		},
+	}
+	raw, err := json.Marshal(&ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := a.Send(context.Background(), destinations.Batch{ID: "batch-b", Events: []json.RawMessage{raw}, PreparedAt: time.Now()})
+	if !res.OK {
+		t.Fatalf("Send result = %+v", res)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(gotBody), &body); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, gotBody)
+	}
+	if body["costUsd"] != 0.0123 {
+		t.Fatalf("costUsd = %v, want 0.0123: %#v", body["costUsd"], body)
+	}
+	if body["tokensIn"] != float64(1500) {
+		t.Fatalf("tokensIn = %v, want 1500: %#v", body["tokensIn"], body)
+	}
+	if body["tokensOut"] != float64(300) {
+		t.Fatalf("tokensOut = %v, want 300: %#v", body["tokensOut"], body)
+	}
+	if body["model"] != "claude-sonnet-4-6" {
+		t.Fatalf("model = %v: %#v", body["model"], body)
+	}
+	if body["provider"] != "anthropic" {
+		t.Fatalf("provider = %v: %#v", body["provider"], body)
+	}
+	if body["pricingSource"] != "reported" {
+		t.Fatalf("pricingSource = %v: %#v", body["pricingSource"], body)
+	}
+}
+
+func TestWebhookScoutOmitsBillingFieldsWhenAbsent(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reader io.Reader = r.Body
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gz, _ := gzip.NewReader(r.Body)
+			defer gz.Close()
+			reader = gz
+		}
+		b, _ := io.ReadAll(reader)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	a, err := New(Config{Name: "default", APIBase: srv.URL, AgentID: "agent-1"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := a.Send(context.Background(), destinations.Batch{ID: "b", Events: []json.RawMessage{testToolCallEvent(t, true)}, PreparedAt: time.Now()})
+	if !res.OK {
+		t.Fatalf("Send: %+v", res)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(gotBody), &body); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	for _, key := range []string{"costUsd", "tokensIn", "tokensOut", "model", "provider", "pricingSource"} {
+		if _, ok := body[key]; ok {
+			t.Fatalf("expected %s absent when no billing block, got %#v", key, body)
+		}
+	}
+}
+
 func TestWebhookScoutSendsEachBatchEventSeparately(t *testing.T) {
 	var hits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

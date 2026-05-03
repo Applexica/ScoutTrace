@@ -9,12 +9,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/webhookscout/scouttrace/internal/billing"
 	"github.com/webhookscout/scouttrace/internal/event"
 	"github.com/webhookscout/scouttrace/internal/jsonrpc"
 	"github.com/webhookscout/scouttrace/internal/queue"
 	"github.com/webhookscout/scouttrace/internal/redact"
 	"github.com/webhookscout/scouttrace/internal/wire"
 )
+
+// StaticPriceLookup is the callback used to resolve a configured static
+// per-tool price for a (server, tool) pair. A nil lookup disables static
+// pricing.
+type StaticPriceLookup = billing.StaticPriceLookup
 
 // CaptureWorker consumes wire frames, builds envelopes, applies redaction,
 // and persists them to the queue.
@@ -31,6 +37,9 @@ type CaptureWorker struct {
 	MaxArgBytes    int // 0 = unlimited
 	MaxResultBytes int // 0 = unlimited
 	Logger         func(format string, args ...any)
+	// StaticPrices is consulted when the response carries no reported cost
+	// and no model/tokens-derived estimate is available. May be nil.
+	StaticPrices StaticPriceLookup
 
 	// metrics
 	parseErrors uint64
@@ -213,6 +222,20 @@ func (cw *CaptureWorker) emitToolCall(p jsonrpc.MatchedPair) {
 		StartedAt: p.StartedAt,
 		EndedAt:   p.EndedAt,
 		LatencyMS: p.EndedAt.Sub(p.StartedAt).Milliseconds(),
+	}
+	// Best-effort billing extraction from the *raw* result before any
+	// truncation marker has been substituted in. Run on p.Result rather
+	// than resultBytes so we can recognise metadata even when capture is
+	// disabled or the body was truncated.
+	if bb := billing.Enrich(p.Result, cw.Session.ServerName, ev.Tool.Name, cw.StaticPrices); !bb.Empty() {
+		ev.Billing = &event.BillingBlock{
+			CostUSD:       bb.CostUSD,
+			TokensIn:      bb.TokensIn,
+			TokensOut:     bb.TokensOut,
+			Model:         bb.Model,
+			Provider:      bb.Provider,
+			PricingSource: bb.PricingSource,
+		}
 	}
 	// Apply redaction.
 	raw, err := json.Marshal(ev)

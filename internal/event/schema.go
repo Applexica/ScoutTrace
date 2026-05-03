@@ -71,6 +71,19 @@ type RedactionBlock struct {
 	RulesApplied   []string `json:"rules_applied"`
 }
 
+// BillingBlock holds optional cost/token/model accounting metadata. All
+// fields are optional — pointer-typed numerics distinguish "not reported"
+// from "reported as zero." PricingSource records where the cost came from
+// (e.g. "reported", "estimated", "static").
+type BillingBlock struct {
+	CostUSD       *float64 `json:"cost_usd,omitempty"`
+	TokensIn      *int     `json:"tokens_in,omitempty"`
+	TokensOut     *int     `json:"tokens_out,omitempty"`
+	Model         string   `json:"model,omitempty"`
+	Provider      string   `json:"provider,omitempty"`
+	PricingSource string   `json:"pricing_source,omitempty"`
+}
+
 // ToolCallEvent is the canonical post-redaction envelope.
 type ToolCallEvent struct {
 	ID         string         `json:"id"`
@@ -86,6 +99,7 @@ type ToolCallEvent struct {
 	Response   ResponseBlock  `json:"response"`
 	Timing     TimingBlock    `json:"timing"`
 	Redaction  RedactionBlock `json:"redaction"`
+	Billing    *BillingBlock  `json:"billing,omitempty"`
 }
 
 // Session metadata held per proxy invocation.

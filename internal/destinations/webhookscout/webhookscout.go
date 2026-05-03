@@ -157,5 +157,25 @@ func mapToolCallEvent(raw json.RawMessage) ([]byte, error) {
 			out["output"] = string(ev.Response.Error)
 		}
 	}
+	if ev.Billing != nil {
+		if ev.Billing.CostUSD != nil {
+			out["costUsd"] = *ev.Billing.CostUSD
+		}
+		if ev.Billing.TokensIn != nil {
+			out["tokensIn"] = *ev.Billing.TokensIn
+		}
+		if ev.Billing.TokensOut != nil {
+			out["tokensOut"] = *ev.Billing.TokensOut
+		}
+		if ev.Billing.Model != "" {
+			out["model"] = ev.Billing.Model
+		}
+		if ev.Billing.Provider != "" {
+			out["provider"] = ev.Billing.Provider
+		}
+		if ev.Billing.PricingSource != "" {
+			out["pricingSource"] = ev.Billing.PricingSource
+		}
+	}
 	return json.Marshal(out)
 }

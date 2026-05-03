@@ -99,6 +99,7 @@ func CmdProxy(ctx context.Context, g *Globals, args []string) int {
 			ScoutVersion:   "0.1.0",
 			MaxArgBytes:    maxArg,
 			MaxResultBytes: maxRes,
+			StaticPrices:   c.StaticPriceLookup(),
 		})
 	}
 
