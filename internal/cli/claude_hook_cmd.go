@@ -99,6 +99,14 @@ func claudeHookPostToolUse(ctx context.Context, g *Globals, args []string) int {
 		return 0
 	}
 
+	var hp claudeToolHookPayload
+	if err := json.Unmarshal(body, &hp); err != nil {
+		fmt.Fprintln(g.Stderr, "claude-hook:", err)
+		if *failClosed {
+			return 1
+		}
+		return 0
+	}
 	env, err := buildClaudeHookEvent(body, c, *hostVersion)
 	if err != nil {
 		fmt.Fprintln(g.Stderr, "claude-hook:", err)
@@ -131,10 +139,46 @@ func claudeHookPostToolUse(ctx context.Context, g *Globals, args []string) int {
 		}
 		return 0
 	}
+
+	// Beside the per-tool event, scan the transcript for any new assistant
+	// LLM turns that completed since the last hook fire. In a long Claude
+	// tool loop dozens of PostToolUse events arrive before Stop; emitting
+	// llm_turn events here makes their billing visible in real time. The
+	// shared cursor in buildClaudeLLMTurnEvents dedupes against the final
+	// Stop catch-up so events are never enqueued twice.
+	llmEvents := buildClaudeLLMTurnEventsFromPostTool(g, &hp, c, *hostVersion)
+	llmIDs := make([]string, 0, len(llmEvents))
+	for _, lev := range llmEvents {
+		lpayload, err := json.Marshal(lev)
+		if err != nil {
+			fmt.Fprintln(g.Stderr, "claude-hook:", err)
+			if *failClosed {
+				return 1
+			}
+			continue
+		}
+		if err := q.Enqueue(lev.ID, dest, lpayload); err != nil {
+			fmt.Fprintln(g.Stderr, "claude-hook:", err)
+			if *failClosed {
+				return 1
+			}
+			continue
+		}
+		llmIDs = append(llmIDs, lev.ID)
+	}
+
 	if g.JSON {
-		_ = printJSON(g.Stdout, map[string]string{"id": env.ID, "destination": dest}, false)
+		out := map[string]any{"id": env.ID, "destination": dest}
+		if len(llmIDs) > 0 {
+			out["llm_turn_ids"] = llmIDs
+			out["llm_turn_count"] = len(llmIDs)
+		}
+		_ = printJSON(g.Stdout, out, false)
 	} else if g.Verbose > 0 {
 		fmt.Fprintf(g.Stderr, "claude-hook: enqueued %s → %s\n", env.ID, dest)
+		if len(llmIDs) > 0 {
+			fmt.Fprintf(g.Stderr, "claude-hook: enqueued %d llm_turn event(s) → %s\n", len(llmIDs), dest)
+		}
 	}
 
 	if *flush {
@@ -146,6 +190,25 @@ func claudeHookPostToolUse(ctx context.Context, g *Globals, args []string) int {
 		}
 	}
 	return 0
+}
+
+// buildClaudeLLMTurnEventsFromPostTool runs the transcript scan during a
+// PostToolUse invocation. Errors here are non-fatal: capture continues with
+// the tool event already enqueued and the cursor will catch up on the next
+// fire (or on Stop). The hook payload may legitimately omit transcript_path
+// for synthetic test inputs, in which case we silently skip.
+func buildClaudeLLMTurnEventsFromPostTool(g *Globals, hp *claudeToolHookPayload, c *config.Config, hostVersion string) []*event.ToolCallEvent {
+	if hp == nil || hp.TranscriptPath == "" || g == nil || g.Home == "" {
+		return nil
+	}
+	events, err := buildClaudeLLMTurnEvents(hp.TranscriptPath, hp.SessionID, c, hostVersion, g.Home)
+	if err != nil {
+		if g.Verbose > 0 {
+			fmt.Fprintln(g.Stderr, "claude-hook: transcript scan skipped:", err)
+		}
+		return nil
+	}
+	return events
 }
 
 type claudeStopHookPayload struct {
@@ -254,10 +317,12 @@ func claudeHookStop(ctx context.Context, g *Globals, args []string) int {
 
 // buildClaudeStopEvents reads the Claude Code Stop hook payload and emits one
 // llm_turn ToolCallEvent per NEW assistant transcript line that carries both
-// message.model and message.usage. A persistent per-transcript byte-offset
-// cursor under <scoutHome>/claude_hook/cursors/ ensures repeated Stop hook
-// invocations only enqueue events for lines appended since the last call —
-// without it, every Stop fires would re-emit the entire transcript.
+// message.model and message.usage. The same scan is also driven by every
+// PostToolUse invocation (see claudeHookPostToolUse) so that long Claude tool
+// loops stream LLM turns to the destination as they happen rather than being
+// held until Stop fires. A persistent per-transcript cursor under
+// <scoutHome>/claude_hook/cursors/ ensures repeated invocations only enqueue
+// events for lines appended since the last call.
 //
 // Each event carries only billing metadata; the transcript's user and
 // assistant content is never copied into Request/Response so prompts and
@@ -271,11 +336,24 @@ func buildClaudeStopEvents(body []byte, c *config.Config, hostVersion, scoutHome
 	if hp.TranscriptPath == "" {
 		return nil, fmt.Errorf("missing transcript_path")
 	}
+	return buildClaudeLLMTurnEvents(hp.TranscriptPath, hp.SessionID, c, hostVersion, scoutHome)
+}
 
-	cursorPath := claudeStopCursorPath(scoutHome, hp.SessionID, hp.TranscriptPath)
-	startOffset := readClaudeStopCursor(cursorPath)
+// buildClaudeLLMTurnEvents scans transcriptPath from the persisted cursor and
+// returns one llm_turn event per new assistant entry that carries model+usage.
+// Both the Stop hook and each PostToolUse hook drive this so events stream out
+// during a long tool loop. The cursor — a JSON {offset, prior_effective_in}
+// blob — both prevents re-emitting old lines and supplies the running
+// effectiveIn baseline used to compute incremental tokens_in deltas.
+func buildClaudeLLMTurnEvents(transcriptPath, hookSessionID string, c *config.Config, hostVersion, scoutHome string) ([]*event.ToolCallEvent, error) {
+	if transcriptPath == "" {
+		return nil, fmt.Errorf("missing transcript_path")
+	}
 
-	turns, endOffset, err := readNewAssistantUsageLines(hp.TranscriptPath, startOffset)
+	cursorPath := claudeTranscriptCursorPath(scoutHome, hookSessionID, transcriptPath)
+	startCursor := readClaudeTranscriptCursor(cursorPath)
+
+	turns, endCursor, err := readNewAssistantUsageLines(transcriptPath, startCursor)
 	if err != nil {
 		return nil, err
 	}
@@ -283,16 +361,24 @@ func buildClaudeStopEvents(body []byte, c *config.Config, hostVersion, scoutHome
 	const serverName = "claude-code"
 	const toolName = "llm_turn"
 
-	sessionID := hp.SessionID
+	sessionID := hookSessionID
 	if sessionID == "" {
 		sessionID = event.NewULID()
 	}
 
 	out := make([]*event.ToolCallEvent, 0, len(turns))
 	for _, t := range turns {
+		// Build a synthetic billing payload using the *incremental* token
+		// counts so Estimate() produces a per-turn cost rather than a
+		// cumulative one. cache_creation_*/cache_read_* are intentionally
+		// omitted from the synthetic usage because the delta has already
+		// folded those in via TokensInDelta.
 		syntheticRaw, err := json.Marshal(map[string]any{
 			"model": t.Model,
-			"usage": json.RawMessage(t.Usage),
+			"usage": map[string]any{
+				"input_tokens":  t.TokensInDelta,
+				"output_tokens": t.OutputTokens,
+			},
 		})
 		if err != nil {
 			return nil, err
@@ -327,48 +413,72 @@ func buildClaudeStopEvents(body []byte, c *config.Config, hostVersion, scoutHome
 		out = append(out, final)
 	}
 
-	// Always advance the cursor to the end of the consumed prefix, even when
-	// no qualifying assistant lines were present, so non-assistant lines do
-	// not get re-scanned on the next invocation.
-	if endOffset > startOffset {
-		_ = writeClaudeStopCursor(cursorPath, endOffset)
+	// Persist the cursor whenever the offset advanced — even with no new
+	// qualifying assistant lines — so non-assistant lines are not re-scanned.
+	// PriorEffectiveIn is also persisted so the next invocation can compute
+	// the next incremental delta correctly.
+	if endCursor.Offset > startCursor.Offset || endCursor.PriorEffectiveIn != startCursor.PriorEffectiveIn {
+		_ = writeClaudeTranscriptCursor(cursorPath, endCursor)
 	}
 
 	return out, nil
 }
 
-// claudeStopTurn is one assistant transcript entry's billing-relevant fields.
+// claudeStopTurn is one assistant transcript entry's billing-relevant fields,
+// already adjusted to per-turn incremental token counts.
 type claudeStopTurn struct {
-	Model string
-	Usage json.RawMessage
+	Model         string
+	TokensInDelta int
+	OutputTokens  int
 }
 
-// readNewAssistantUsageLines scans the transcript starting at startOffset and
+// claudeTranscriptCursor is the persisted state for a transcript scan.
+// Offset is the byte offset just past the last fully-consumed line.
+// PriorEffectiveIn is the cumulative effective input-token total reported by
+// the most recent assistant line we have already emitted; it is the baseline
+// the next scan subtracts from to compute an incremental tokens_in.
+type claudeTranscriptCursor struct {
+	Offset           int64 `json:"offset"`
+	PriorEffectiveIn int   `json:"prior_effective_in"`
+}
+
+// readNewAssistantUsageLines scans the transcript starting at start.Offset and
 // returns one claudeStopTurn per fully-terminated assistant line carrying
-// model+usage. It returns the byte offset at the end of the last fully-read
-// line so callers can persist the cursor; partial trailing lines (no \n) are
-// not consumed and will be picked up on a future invocation.
-func readNewAssistantUsageLines(path string, startOffset int64) ([]claudeStopTurn, int64, error) {
+// model+usage. Each turn's TokensInDelta is computed as
+// effectiveIn(line) - runningEffectiveIn, where effectiveIn sums input_tokens
+// + cache_creation_input_tokens + cache_read_input_tokens (both snake_case and
+// camelCase variants). When the delta would be zero or negative — for example
+// after a context reset that shrinks the cumulative total — the current
+// effectiveIn is used directly so we do not under-bill the new context.
+//
+// The returned cursor reflects the byte offset of the last fully-read line
+// and the running effectiveIn carried forward to the next scan. Partial
+// trailing lines (no \n) are not consumed and will be picked up later.
+func readNewAssistantUsageLines(path string, start claudeTranscriptCursor) ([]claudeStopTurn, claudeTranscriptCursor, error) {
+	end := start
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, 0, fmt.Errorf("open transcript: %w", err)
+		return nil, end, fmt.Errorf("open transcript: %w", err)
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return nil, 0, fmt.Errorf("stat transcript: %w", err)
+		return nil, end, fmt.Errorf("stat transcript: %w", err)
 	}
-	if startOffset > info.Size() {
-		// File was truncated or rotated; reset.
-		startOffset = 0
+	if start.Offset > info.Size() {
+		// File was truncated or rotated; reset both offset and prior so the
+		// new transcript bills from zero.
+		start = claudeTranscriptCursor{}
+		end = start
 	}
-	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
-		return nil, 0, fmt.Errorf("seek transcript: %w", err)
+	if _, err := f.Seek(start.Offset, io.SeekStart); err != nil {
+		return nil, end, fmt.Errorf("seek transcript: %w", err)
 	}
 
 	r := bufio.NewReader(f)
-	consumed := startOffset
+	end.Offset = start.Offset
+	runningEffectiveIn := start.PriorEffectiveIn
 	var out []claudeStopTurn
 	for {
 		line, err := r.ReadBytes('\n')
@@ -377,9 +487,9 @@ func readNewAssistantUsageLines(path string, startOffset int64) ([]claudeStopTur
 			break
 		}
 		if err != nil {
-			return nil, 0, fmt.Errorf("read transcript: %w", err)
+			return nil, end, fmt.Errorf("read transcript: %w", err)
 		}
-		consumed += int64(len(line))
+		end.Offset += int64(len(line))
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) == 0 {
 			continue
@@ -400,18 +510,76 @@ func readNewAssistantUsageLines(path string, startOffset int64) ([]claudeStopTur
 		if entry.Message.Model == "" || len(entry.Message.Usage) == 0 || string(entry.Message.Usage) == "null" {
 			continue
 		}
-		usageCopy := make(json.RawMessage, len(entry.Message.Usage))
-		copy(usageCopy, entry.Message.Usage)
-		out = append(out, claudeStopTurn{Model: entry.Message.Model, Usage: usageCopy})
+		effIn, outTokens := transcriptUsageTokens(entry.Message.Usage)
+		var delta int
+		if effIn > runningEffectiveIn {
+			delta = effIn - runningEffectiveIn
+		} else {
+			// Context shrank or reset — bill only the current turn's tokens.
+			delta = effIn
+		}
+		runningEffectiveIn = effIn
+		out = append(out, claudeStopTurn{
+			Model:         entry.Message.Model,
+			TokensInDelta: delta,
+			OutputTokens:  outTokens,
+		})
 	}
-	return out, consumed, nil
+	end.PriorEffectiveIn = runningEffectiveIn
+	return out, end, nil
 }
 
-// claudeStopCursorPath derives a deterministic file path for the per-transcript
-// cursor. The hash mixes session id and transcript path so two sessions
-// pointing at the same path do not collide, and so the filename is filesystem-
-// safe regardless of the original transcript location.
-func claudeStopCursorPath(scoutHome, sessionID, transcriptPath string) string {
+// transcriptUsageTokens extracts the cumulative effective input-token total
+// (input_tokens + cache_creation_input_tokens + cache_read_input_tokens, with
+// camelCase aliases) and the current output_tokens from a single assistant
+// transcript usage object. Unknown fields are ignored so a future Anthropic
+// usage shape change cannot crash the scan.
+func transcriptUsageTokens(usage json.RawMessage) (effectiveIn, outputTokens int) {
+	var u map[string]any
+	if err := json.Unmarshal(usage, &u); err != nil {
+		return 0, 0
+	}
+	for _, key := range []string{
+		"input_tokens", "inputTokens",
+		"cache_creation_input_tokens", "cacheCreationInputTokens",
+		"cache_read_input_tokens", "cacheReadInputTokens",
+	} {
+		if v, ok := u[key]; ok {
+			if n, ok := jsonNumberToInt(v); ok {
+				effectiveIn += n
+			}
+		}
+	}
+	for _, key := range []string{"output_tokens", "outputTokens"} {
+		if v, ok := u[key]; ok {
+			if n, ok := jsonNumberToInt(v); ok {
+				outputTokens = n
+				break
+			}
+		}
+	}
+	return effectiveIn, outputTokens
+}
+
+func jsonNumberToInt(v any) (int, bool) {
+	switch x := v.(type) {
+	case float64:
+		return int(x), true
+	case int:
+		return x, true
+	case json.Number:
+		if n, err := x.Int64(); err == nil {
+			return int(n), true
+		}
+	}
+	return 0, false
+}
+
+// claudeTranscriptCursorPath derives a deterministic file path for the
+// per-transcript cursor. The hash mixes session id and transcript path so two
+// sessions pointing at the same path do not collide, and so the filename is
+// filesystem-safe regardless of the original transcript location.
+func claudeTranscriptCursorPath(scoutHome, sessionID, transcriptPath string) string {
 	if scoutHome == "" {
 		return ""
 	}
@@ -419,34 +587,49 @@ func claudeStopCursorPath(scoutHome, sessionID, transcriptPath string) string {
 	return filepath.Join(scoutHome, "claude_hook", "cursors", hex.EncodeToString(h[:])+".cursor")
 }
 
-// readClaudeStopCursor returns the previously-saved byte offset for path, or
-// 0 if no cursor exists or the on-disk content is unparsable.
-func readClaudeStopCursor(path string) int64 {
+// readClaudeTranscriptCursor returns the persisted cursor state for path. The
+// on-disk format is a JSON object {offset, prior_effective_in}; for backward
+// compatibility with v0.1.11 and earlier (which wrote a plain decimal offset)
+// a bare integer is parsed as offset with PriorEffectiveIn=0. A missing or
+// unparsable file yields a zero-valued cursor.
+func readClaudeTranscriptCursor(path string) claudeTranscriptCursor {
 	if path == "" {
-		return 0
+		return claudeTranscriptCursor{}
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		return claudeTranscriptCursor{}
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-	if err != nil || n < 0 {
-		return 0
+	trimmed := strings.TrimSpace(string(b))
+	if trimmed == "" {
+		return claudeTranscriptCursor{}
 	}
-	return n
+	var cur claudeTranscriptCursor
+	if err := json.Unmarshal([]byte(trimmed), &cur); err == nil && cur.Offset >= 0 && cur.PriorEffectiveIn >= 0 {
+		return cur
+	}
+	// Legacy plain-integer cursor.
+	if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil && n >= 0 {
+		return claudeTranscriptCursor{Offset: n}
+	}
+	return claudeTranscriptCursor{}
 }
 
-// writeClaudeStopCursor persists the byte offset to the cursor file, creating
-// any missing parent directories. Errors are non-fatal (cursor will reset on
-// the next invocation), so callers may discard the return value.
-func writeClaudeStopCursor(path string, offset int64) error {
+// writeClaudeTranscriptCursor persists the cursor state, creating any missing
+// parent directories. Errors are non-fatal (cursor will reset on the next
+// invocation), so callers may discard the return value.
+func writeClaudeTranscriptCursor(path string, cur claudeTranscriptCursor) error {
 	if path == "" {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(strconv.FormatInt(offset, 10)), 0o600)
+	b, err := json.Marshal(cur)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
 }
 
 func buildClaudeHookEvent(body []byte, c *config.Config, hostVersion string) (*event.ToolCallEvent, error) {

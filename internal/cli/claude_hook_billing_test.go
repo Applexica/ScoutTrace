@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -193,6 +194,9 @@ func TestClaudeHookStopBuildsOneEventPerAssistantLine(t *testing.T) {
 	dir := t.TempDir()
 	home := t.TempDir()
 	transcript := filepath.Join(dir, "session.jsonl")
+	// Effective input totals along the way: 10, 777, 3. Incremental deltas are
+	// 10 (first), 777-10=767 (second), and on the third the running total
+	// shrinks from 777 to 3 — a context reset — so we bill the current 3.
 	content := `{"type":"user","message":{"role":"user","content":"hi"}}` + "\n" +
 		`{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":5}}}` + "\n" +
 		`{"type":"user","message":{"role":"user","content":"again"}}` + "\n" +
@@ -214,7 +218,7 @@ func TestClaudeHookStopBuildsOneEventPerAssistantLine(t *testing.T) {
 		t.Fatalf("len(events) = %d, want 3 (one per assistant line)", len(events))
 	}
 	wantModels := []string{"claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"}
-	wantTokensIn := []int{10, 777, 3}
+	wantTokensIn := []int{10, 767, 3}
 	wantTokensOut := []int{5, 42, 1}
 	seenIDs := map[string]bool{}
 	for i, ev := range events {
@@ -225,7 +229,11 @@ func TestClaudeHookStopBuildsOneEventPerAssistantLine(t *testing.T) {
 			t.Fatalf("event %d model = %q, want %q", i, ev.Billing.Model, wantModels[i])
 		}
 		if ev.Billing.TokensIn == nil || *ev.Billing.TokensIn != wantTokensIn[i] {
-			t.Fatalf("event %d tokens_in = %v, want %d", i, ev.Billing.TokensIn, wantTokensIn[i])
+			got := -1
+			if ev.Billing.TokensIn != nil {
+				got = *ev.Billing.TokensIn
+			}
+			t.Fatalf("event %d tokens_in = %d, want %d", i, got, wantTokensIn[i])
 		}
 		if ev.Billing.TokensOut == nil || *ev.Billing.TokensOut != wantTokensOut[i] {
 			t.Fatalf("event %d tokens_out = %v, want %d", i, ev.Billing.TokensOut, wantTokensOut[i])
@@ -515,5 +523,246 @@ func TestClaudeHookStaticToolPriceFillsMissingCost(t *testing.T) {
 	}
 	if ev.Billing.Provider != "playwright" {
 		t.Fatalf("provider = %q", ev.Billing.Provider)
+	}
+}
+
+// TestClaudeHookPostToolUseScanCollectsLLMTurnsAndStopDedupesThem covers the
+// core fix for v0.1.11: long Claude tool loops would only emit llm_turn events
+// from the Stop hook, so WebhookScout received them all in a single burst at
+// the very end. The fix scans the transcript on every PostToolUse so events
+// stream out in real time, with Stop as a no-op catch-up that reuses the same
+// cursor and therefore must not duplicate already-emitted turns.
+func TestClaudeHookPostToolUseScanCollectsLLMTurnsAndStopDedupesThem(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+
+	// Mid-loop transcript state after the first assistant turn lands.
+	first := `{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":5}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(first), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	// PostToolUse scan #1: should pick up the new turn.
+	postEvents1, err := buildClaudeLLMTurnEvents(transcript, "sess", &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("post #1: %v", err)
+	}
+	if len(postEvents1) != 1 {
+		t.Fatalf("post #1 len = %d, want 1", len(postEvents1))
+	}
+
+	// A second PostToolUse fires before any new assistant turn lands. The
+	// cursor must remember what we already emitted so we do not double-bill.
+	postEvents2, err := buildClaudeLLMTurnEvents(transcript, "sess", &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("post #2: %v", err)
+	}
+	if len(postEvents2) != 0 {
+		t.Fatalf("post #2 len = %d, want 0 (dedupe via cursor)", len(postEvents2))
+	}
+
+	// A second assistant turn appends; PostToolUse scan #3 picks up only that.
+	more := `{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_read_input_tokens":50,"output_tokens":7}}}` + "\n"
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("append open: %v", err)
+	}
+	if _, err := f.WriteString(more); err != nil {
+		t.Fatalf("append write: %v", err)
+	}
+	_ = f.Close()
+
+	postEvents3, err := buildClaudeLLMTurnEvents(transcript, "sess", &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("post #3: %v", err)
+	}
+	if len(postEvents3) != 1 {
+		t.Fatalf("post #3 len = %d, want 1", len(postEvents3))
+	}
+
+	// Stop fires last as the final catch-up. The transcript holds nothing
+	// new, so the Stop hook must yield zero events — no double-billing.
+	stopBody, _ := json.Marshal(map[string]any{
+		"session_id":      "sess",
+		"hook_event_name": "Stop",
+		"transcript_path": transcript,
+	})
+	stopEvents, err := buildClaudeStopEvents(stopBody, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if len(stopEvents) != 0 {
+		t.Fatalf("stop len = %d, want 0 (PostToolUse already drained)", len(stopEvents))
+	}
+}
+
+// TestClaudeHookLLMTurnTokensAreIncrementalNotCumulative pins down the
+// per-call token math: assistant turns in a Claude tool loop report the
+// cumulative effective input each time (input + cache_creation + cache_read),
+// so emitting that raw figure as tokens_in for every turn re-bills the shared
+// context once per turn. The fix subtracts the prior cumulative total
+// persisted in the cursor.
+func TestClaudeHookLLMTurnTokensAreIncrementalNotCumulative(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+
+	// Two assistant turns: first reports a cumulative effective input of
+	// 68000 (1 input + 67999 cache_creation), the second 68500 (1 input +
+	// 500 cache_creation + 67999 cache_read). The expected event tokens_in
+	// values are 68000 and 500.
+	content := `{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":67999,"cache_read_input_tokens":0,"output_tokens":42}}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":500,"cache_read_input_tokens":67999,"output_tokens":17}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(content), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"session_id":      "sess",
+		"hook_event_name": "Stop",
+		"transcript_path": transcript,
+	})
+	events, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("buildClaudeStopEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2", len(events))
+	}
+	wantTokensIn := []int{68000, 500}
+	wantTokensOut := []int{42, 17}
+	for i, ev := range events {
+		if ev.Billing == nil {
+			t.Fatalf("event %d billing nil", i)
+		}
+		if ev.Billing.TokensIn == nil || *ev.Billing.TokensIn != wantTokensIn[i] {
+			got := -1
+			if ev.Billing.TokensIn != nil {
+				got = *ev.Billing.TokensIn
+			}
+			t.Fatalf("event %d tokens_in = %d, want %d", i, got, wantTokensIn[i])
+		}
+		if ev.Billing.TokensOut == nil || *ev.Billing.TokensOut != wantTokensOut[i] {
+			t.Fatalf("event %d tokens_out = %v, want %d", i, ev.Billing.TokensOut, wantTokensOut[i])
+		}
+		// Cost must be derived from the incremental tokens: the second
+		// event's estimated cost should be strictly less than the first
+		// because tokens_in dropped from 68000 to 500 (with output also
+		// shrinking from 42 to 17). If the bug were present both events
+		// would have ~equal cost.
+		if ev.Billing.CostUSD == nil {
+			t.Fatalf("event %d cost_usd nil; expected estimate", i)
+		}
+	}
+	if *events[1].Billing.CostUSD >= *events[0].Billing.CostUSD {
+		t.Fatalf("incremental cost regression: event[1].cost (%f) should be < event[0].cost (%f)",
+			*events[1].Billing.CostUSD, *events[0].Billing.CostUSD)
+	}
+}
+
+// TestClaudeHookCursorBackwardCompatLegacyIntegerOffset verifies that a
+// cursor file written by v0.1.11 (a bare decimal byte offset) is still
+// honored after upgrading to the JSON {offset, prior_effective_in} shape.
+// Without this, an upgrade would re-emit the entire transcript on the first
+// hook fire.
+func TestClaudeHookCursorBackwardCompatLegacyIntegerOffset(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+	first := `{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":5}}}` + "\n"
+	second := `{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":20,"output_tokens":7}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(first+second), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	// Pre-seed a legacy cursor: a plain integer byte offset matching the
+	// length of the first line, exactly what v0.1.11 wrote.
+	cursorPath := claudeTranscriptCursorPath(home, "sess", transcript)
+	if err := os.MkdirAll(filepath.Dir(cursorPath), 0o700); err != nil {
+		t.Fatalf("mkdir cursor: %v", err)
+	}
+	legacy := []byte(strconv.FormatInt(int64(len(first)), 10))
+	if err := os.WriteFile(cursorPath, legacy, 0o600); err != nil {
+		t.Fatalf("write legacy cursor: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"session_id":      "sess",
+		"hook_event_name": "Stop",
+		"transcript_path": transcript,
+	})
+	events, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("buildClaudeStopEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("legacy cursor: len(events) = %d, want 1 (only the second line is new)", len(events))
+	}
+	if events[0].Billing == nil || events[0].Billing.Model != "claude-sonnet-4-6" {
+		t.Fatalf("legacy cursor: model = %+v, want claude-sonnet-4-6", events[0].Billing)
+	}
+	// Because the legacy cursor had no prior_effective_in, the second turn
+	// is billed against a baseline of 0, so the full 20 tokens are charged.
+	if events[0].Billing.TokensIn == nil || *events[0].Billing.TokensIn != 20 {
+		got := -1
+		if events[0].Billing.TokensIn != nil {
+			got = *events[0].Billing.TokensIn
+		}
+		t.Fatalf("legacy cursor: tokens_in = %d, want 20 (prior=0 from legacy file)", got)
+	}
+
+	// After this run, the cursor must have been rewritten in the new JSON
+	// shape so subsequent fires get incremental deltas.
+	raw, err := os.ReadFile(cursorPath)
+	if err != nil {
+		t.Fatalf("read cursor: %v", err)
+	}
+	var cur claudeTranscriptCursor
+	if err := json.Unmarshal(raw, &cur); err != nil {
+		t.Fatalf("cursor not rewritten as JSON: %s", raw)
+	}
+	if cur.PriorEffectiveIn != 20 {
+		t.Fatalf("cursor.prior_effective_in = %d, want 20", cur.PriorEffectiveIn)
+	}
+}
+
+// TestClaudeHookPostToolUseScanDoesNotLeakTranscriptContent covers the
+// privacy guarantee on the new PostToolUse-driven path: even though
+// PostToolUse now scans the transcript directly, no user prompt or assistant
+// content can appear in any emitted event envelope.
+func TestClaudeHookPostToolUseScanDoesNotLeakTranscriptContent(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+	content := `{"type":"user","message":{"role":"user","content":"my secret prompt with whs_test_abcdefghijklmnop"}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":5},"content":"first reply with sensitive data"}}` + "\n" +
+		`{"type":"user","message":{"role":"user","content":"PROMPT_TWO_LEAK"}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"cache_read_input_tokens":2000,"output_tokens":3},"content":"REPLY_TWO_LEAK"}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(content), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	events, err := buildClaudeLLMTurnEvents(transcript, "sess", &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("buildClaudeLLMTurnEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2", len(events))
+	}
+	for i, ev := range events {
+		raw, _ := json.Marshal(ev)
+		if strings.Contains(string(raw), transcript) {
+			t.Fatalf("event %d leaks transcript path:\n%s", i, raw)
+		}
+		for _, leaked := range []string{
+			"secret prompt", "sensitive data",
+			"whs_test_abcdefghijklmnop",
+			"PROMPT_TWO_LEAK", "REPLY_TWO_LEAK",
+		} {
+			if contains(string(raw), leaked) {
+				t.Fatalf("event %d leaked %q from transcript:\n%s", i, leaked, raw)
+			}
+		}
 	}
 }
