@@ -366,23 +366,9 @@ func buildClaudeLLMTurnEvents(transcriptPath, hookSessionID string, c *config.Co
 		sessionID = event.NewULID()
 	}
 
+	live, liveSource := liveLookup(c)
 	out := make([]*event.ToolCallEvent, 0, len(turns))
 	for _, t := range turns {
-		// Build a synthetic billing payload using the *incremental* token
-		// counts so Estimate() produces a per-turn cost rather than a
-		// cumulative one. cache_creation_*/cache_read_* are intentionally
-		// omitted from the synthetic usage because the delta has already
-		// folded those in via TokensInDelta.
-		syntheticRaw, err := json.Marshal(map[string]any{
-			"model": t.Model,
-			"usage": map[string]any{
-				"input_tokens":  t.TokensInDelta,
-				"output_tokens": t.OutputTokens,
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
 		now := time.Now().UTC()
 		ev := &event.ToolCallEvent{
 			ID:         event.NewULIDAt(now),
@@ -403,7 +389,7 @@ func buildClaudeLLMTurnEvents(transcriptPath, hookSessionID string, c *config.Co
 			Response: event.ResponseBlock{OK: true},
 			Timing:   event.TimingBlock{StartedAt: now, EndedAt: now, LatencyMS: 0},
 		}
-		if bb := billing.Enrich(syntheticRaw, serverName, toolName, staticLookup(c)); !bb.Empty() {
+		if bb := buildLLMTurnBilling(t, live, liveSource); !bb.Empty() {
 			ev.Billing = eventBillingBlock(bb)
 		}
 		final, err := finalizeWithRedaction(ev, c)
@@ -424,12 +410,82 @@ func buildClaudeLLMTurnEvents(transcriptPath, hookSessionID string, c *config.Co
 	return out, nil
 }
 
+// buildLLMTurnBilling constructs the billing.Block for a single transcript
+// turn. It preserves the displayed/incremental tokens_in convention
+// (TokensInDelta) but apportions that delta across input / cache_creation /
+// cache_read using THIS turn's per-call breakdown so the live provider's
+// cache rates apply to the cache portion. When live pricing is unavailable,
+// the apportionment is irrelevant — EstimateUsage's static fallback charges
+// the full delta at input_per_1m, exactly matching the legacy behavior.
+//
+// Returns an empty Block when the model is unknown to both live and static
+// pricing — callers can drop the Billing pointer in that case.
+func buildLLMTurnBilling(t claudeStopTurn, live billing.LiveLookup, liveSource string) billing.Block {
+	usage := apportionUsage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cost, source, ok := billing.EstimateUsage(ctx, live, liveSource, t.Model, usage)
+	if !ok {
+		return billing.Block{}
+	}
+	tokensIn := t.TokensInDelta
+	tokensOut := t.OutputTokens
+	c := cost
+	return billing.Block{
+		CostUSD:       &c,
+		TokensIn:      &tokensIn,
+		TokensOut:     &tokensOut,
+		Model:         t.Model,
+		Provider:      billing.LookupProvider(t.Model),
+		PricingSource: source,
+	}
+}
+
+// apportionUsage splits the delta tokens_in across the per-call breakdown so
+// cache_creation / cache_read each get their own (typically cheaper) rate.
+// Apportionment uses THIS turn's component ratios — a reasonable proxy when
+// the cumulative deltas don't expose the per-component split directly.
+//
+// Edge cases: when no cache fields were reported (CurCacheCreation=0 and
+// CurCacheRead=0) the entire delta is billed as Input — preserving exactly
+// the legacy behavior. When the apportioned input + cache_creation rounds
+// would lose tokens to floor() error, the residue is folded into CacheRead so
+// the total stays equal to TokensInDelta.
+func apportionUsage(t claudeStopTurn) billing.Usage {
+	if t.TokensInDelta <= 0 || (t.CurCacheCreation == 0 && t.CurCacheRead == 0) {
+		return billing.Usage{Input: t.TokensInDelta, Output: t.OutputTokens}
+	}
+	totalCur := t.CurInput + t.CurCacheCreation + t.CurCacheRead
+	if totalCur <= 0 {
+		return billing.Usage{Input: t.TokensInDelta, Output: t.OutputTokens}
+	}
+	delta := t.TokensInDelta
+	inDelta := delta * t.CurInput / totalCur
+	cwDelta := delta * t.CurCacheCreation / totalCur
+	crDelta := delta - inDelta - cwDelta
+	return billing.Usage{
+		Input:         inDelta,
+		CacheCreation: cwDelta,
+		CacheRead:     crDelta,
+		Output:        t.OutputTokens,
+	}
+}
+
 // claudeStopTurn is one assistant transcript entry's billing-relevant fields,
-// already adjusted to per-turn incremental token counts.
+// already adjusted to per-turn incremental token counts. CurInput,
+// CurCacheCreation and CurCacheRead carry the per-call breakdown reported by
+// THIS line's usage object. They are used to apportion TokensInDelta across
+// input / cache_creation / cache_read at billing time so the live provider's
+// cache rates (when known) actually apply to the cache portion of the new
+// tokens. They are not persisted in the cursor — they are derived afresh on
+// every scan from the line itself.
 type claudeStopTurn struct {
-	Model         string
-	TokensInDelta int
-	OutputTokens  int
+	Model            string
+	TokensInDelta    int
+	OutputTokens     int
+	CurInput         int
+	CurCacheCreation int
+	CurCacheRead     int
 }
 
 // claudeTranscriptCursor is the persisted state for a transcript scan.
@@ -521,7 +577,8 @@ func readNewAssistantUsageLines(path string, start claudeTranscriptCursor) ([]cl
 		if entry.Message.Model == "" || len(entry.Message.Usage) == 0 || string(entry.Message.Usage) == "null" {
 			continue
 		}
-		effIn, outTokens := transcriptUsageTokens(entry.Message.Usage)
+		usage := transcriptUsageBreakdownOf(entry.Message.Usage)
+		effIn, outTokens := usage.EffectiveIn(), usage.Output
 		messageKey := claudeAssistantMessageKey(entry.Message.ID, entry.RequestID)
 		if messageKey != "" && seenMessageKeys[messageKey] {
 			// Claude Code can append the same assistant message multiple times as
@@ -551,13 +608,30 @@ func readNewAssistantUsageLines(path string, start claudeTranscriptCursor) ([]cl
 			end.SeenMessageKeys = appendSeenClaudeMessageKey(end.SeenMessageKeys, messageKey)
 		}
 		out = append(out, claudeStopTurn{
-			Model:         entry.Message.Model,
-			TokensInDelta: delta,
-			OutputTokens:  outTokens,
+			Model:            entry.Message.Model,
+			TokensInDelta:    delta,
+			OutputTokens:     outTokens,
+			CurInput:         usage.Input,
+			CurCacheCreation: usage.CacheCreation,
+			CurCacheRead:     usage.CacheRead,
 		})
 	}
 	end.PriorEffectiveIn = runningEffectiveIn
 	return out, end, nil
+}
+
+// transcriptUsageBreakdown holds the four fields we recognise on a single
+// assistant transcript usage object, plus their effective input sum.
+type transcriptUsageBreakdown struct {
+	Input         int
+	CacheCreation int
+	CacheRead     int
+	Output        int
+}
+
+// EffectiveIn returns input + cache_creation + cache_read.
+func (t transcriptUsageBreakdown) EffectiveIn() int {
+	return t.Input + t.CacheCreation + t.CacheRead
 }
 
 // transcriptUsageTokens extracts the cumulative effective input-token total
@@ -566,30 +640,34 @@ func readNewAssistantUsageLines(path string, start claudeTranscriptCursor) ([]cl
 // transcript usage object. Unknown fields are ignored so a future Anthropic
 // usage shape change cannot crash the scan.
 func transcriptUsageTokens(usage json.RawMessage) (effectiveIn, outputTokens int) {
+	b := transcriptUsageBreakdownOf(usage)
+	return b.EffectiveIn(), b.Output
+}
+
+// transcriptUsageBreakdownOf returns the per-component breakdown of a single
+// assistant turn's usage object. Missing keys default to zero. Both snake_case
+// and camelCase aliases are accepted to match Anthropic's documented shapes.
+func transcriptUsageBreakdownOf(usage json.RawMessage) transcriptUsageBreakdown {
 	var u map[string]any
 	if err := json.Unmarshal(usage, &u); err != nil {
-		return 0, 0
+		return transcriptUsageBreakdown{}
 	}
-	for _, key := range []string{
-		"input_tokens", "inputTokens",
-		"cache_creation_input_tokens", "cacheCreationInputTokens",
-		"cache_read_input_tokens", "cacheReadInputTokens",
-	} {
-		if v, ok := u[key]; ok {
-			if n, ok := jsonNumberToInt(v); ok {
-				effectiveIn += n
+	pick := func(keys ...string) int {
+		for _, key := range keys {
+			if v, ok := u[key]; ok {
+				if n, ok := jsonNumberToInt(v); ok {
+					return n
+				}
 			}
 		}
+		return 0
 	}
-	for _, key := range []string{"output_tokens", "outputTokens"} {
-		if v, ok := u[key]; ok {
-			if n, ok := jsonNumberToInt(v); ok {
-				outputTokens = n
-				break
-			}
-		}
+	return transcriptUsageBreakdown{
+		Input:         pick("input_tokens", "inputTokens"),
+		CacheCreation: pick("cache_creation_input_tokens", "cacheCreationInputTokens"),
+		CacheRead:     pick("cache_read_input_tokens", "cacheReadInputTokens"),
+		Output:        pick("output_tokens", "outputTokens"),
 	}
-	return effectiveIn, outputTokens
 }
 
 func jsonNumberToInt(v any) (int, bool) {
@@ -799,7 +877,10 @@ func enrichClaudeHookBilling(hp *claudeToolHookPayload, serverName, toolName str
 	// cache accounting) and inflated estimated costs. Only metadata reported by
 	// the tool response itself, or an explicit static tool price, is safe to
 	// attribute to this tool event.
-	return billing.Enrich(firstRaw(hp.ToolResponse, hp.ToolResult, hp.ToolOutput), serverName, toolName, staticLookup(c))
+	live, liveSource := liveLookup(c)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return billing.EnrichLive(ctx, firstRaw(hp.ToolResponse, hp.ToolResult, hp.ToolOutput), serverName, toolName, staticLookup(c), live, liveSource)
 }
 
 func staticLookup(c *config.Config) billing.StaticPriceLookup {
@@ -807,6 +888,17 @@ func staticLookup(c *config.Config) billing.StaticPriceLookup {
 		return nil
 	}
 	return c.StaticPriceLookup()
+}
+
+// liveLookup returns the configured live-pricing lookup and source identifier
+// for use inside the Claude hook capture path. A nil lookup means live pricing
+// is disabled (or no config was loaded) and callers should fall back to the
+// static estimate exactly as before.
+func liveLookup(c *config.Config) (billing.LiveLookup, string) {
+	if c == nil {
+		return nil, ""
+	}
+	return c.LiveLookup()
 }
 
 func eventBillingBlock(bb billing.Block) *event.BillingBlock {

@@ -13,6 +13,7 @@ Captured events are written to a local on-disk queue, then dispatched to **any H
 - **Privacy-first redaction.** A `strict | standard | permissive` profile strips well-known secret patterns and PII, normalizes paths, and truncates oversized payloads *before* anything leaves the local process. Capture-level deny rules can drop fields entirely so they never enter the envelope.
 - **Durable local queue.** A simple file-system queue (`pending/` → `inflight/` → `dead/`) survives crashes and restarts. The dispatcher claims rows atomically and applies exponential backoff with jitter on transient failures.
 - **Pluggable destinations.** WebhookScout, generic HTTP webhook, NDJSON `file://...`, or `stdout`. Network destinations require explicit first-send approval.
+- **Live LLM price lookup.** Claude Code `llm_turn` events use real model pricing from PricePerToken's free MCP endpoint when available (`src: pricepertoken`), including cache-read/cache-write rates for Anthropic usage metadata. If the lookup is offline or unknown, ScoutTrace falls back to the built-in static estimate without blocking capture.
 - **Auditable, reversible host changes.** Every host-config patch is backed up; `scouttrace undo` restores the most recent backup. Setup and patching flows expose dry-run or rollback paths so you can inspect changes before trusting them.
 
 ### Claude Code integration in one command
@@ -1238,6 +1239,30 @@ scouttrace config set queue.path /var/lib/scouttrace/queue
 ```
 
 `config set` accepts a vetted allow-list of safe keys. For everything else, edit `~/.scouttrace/config.yaml` directly and run `scouttrace config validate`.
+
+#### Live LLM pricing
+
+ScoutTrace enables live model pricing by default for parsed configs. When an event has model + token metadata and no upstream-reported dollar cost, ScoutTrace queries PricePerToken's no-auth MCP-over-HTTP endpoint, caches the model price in-process, and marks the event with `pricing_source: "pricepertoken"`. If the lookup times out, is offline, or does not know the model, ScoutTrace falls back to the built-in static estimate and keeps capturing.
+
+```json
+{
+  "cost": {
+    "live_pricing": {
+      "enabled": true,
+      "provider": "pricepertoken",
+      "url": "https://api.pricepertoken.com/mcp/mcp",
+      "timeout_ms": 1500,
+      "cache_ttl_hours": 24
+    }
+  }
+}
+```
+
+Set `enabled` to `false` if you need fully offline/static pricing:
+
+```json
+{"cost":{"live_pricing":{"enabled":false}}}
+```
 
 ### `scouttrace destination list|approve|approve-host`
 

@@ -1,5 +1,7 @@
 package billing
 
+import "context"
+
 // StaticPrice represents a configured static per-tool price. Capture paths
 // look one up by (server, tool) and, if matched and no cost was reported,
 // use the configured CostUSD with PricingSource="static".
@@ -22,9 +24,24 @@ type StaticPriceLookup func(serverName, toolName string) (StaticPrice, bool)
 //  3. Otherwise tries to estimate cost from model+tokens via Estimate().
 //  4. Otherwise consults a static per-tool price (if a lookup is supplied).
 //
-// The returned Block is empty (Block{}.Empty() == true) when nothing was
-// recognised; callers can drop the Billing field in that case.
+// Backwards-compatible shim that does not consult a live provider; use
+// EnrichLive for the live-pricing-aware pipeline.
 func Enrich(responsePayload []byte, serverName, toolName string, static StaticPriceLookup) Block {
+	return EnrichLive(context.Background(), responsePayload, serverName, toolName, static, nil, "")
+}
+
+// EnrichLive is Enrich with an optional live-pricing lookup inserted between
+// "reported" and "estimated". Priority chain:
+//
+//  1. Cost reported in the response body  → pricing_source=reported
+//  2. Live provider hit (model + tokens)  → pricing_source=<liveSource>
+//  3. Static built-in table (model+tokens) → pricing_source=estimated
+//  4. Configured static per-tool price     → pricing_source=static
+//
+// A nil live lookup is equivalent to the legacy Enrich() pipeline. Live
+// failures are silent — they fall through to the static estimate so capture
+// is never blocked by network errors.
+func EnrichLive(ctx context.Context, responsePayload []byte, serverName, toolName string, static StaticPriceLookup, live LiveLookup, liveSource string) Block {
 	b := Extract(responsePayload)
 	if b.CostUSD != nil {
 		if b.PricingSource == "" {
@@ -33,7 +50,7 @@ func Enrich(responsePayload []byte, serverName, toolName string, static StaticPr
 		b = fillProvider(b)
 		return b
 	}
-	// Try estimation via tokens+model.
+	// Try estimation via tokens+model — live first, static fallback.
 	if b.Model != "" && (b.TokensIn != nil || b.TokensOut != nil) {
 		var ti, to int
 		if b.TokensIn != nil {
@@ -42,7 +59,7 @@ func Enrich(responsePayload []byte, serverName, toolName string, static StaticPr
 		if b.TokensOut != nil {
 			to = *b.TokensOut
 		}
-		if cost, source, ok := Estimate(b.Model, ti, to); ok {
+		if cost, source, ok := EstimateLive(ctx, live, liveSource, b.Model, ti, to); ok {
 			c := cost
 			b.CostUSD = &c
 			b.PricingSource = source

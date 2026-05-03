@@ -1,6 +1,10 @@
 package billing
 
-import "testing"
+import (
+	"context"
+	"math"
+	"testing"
+)
 
 func TestEstimateReturnsZeroWhenModelUnknown(t *testing.T) {
 	cost, source, ok := Estimate("totally-unknown-model", 100, 100)
@@ -57,5 +61,60 @@ func TestEstimateScalesLinearlyWithTokens(t *testing.T) {
 	ratio := c10 / c1
 	if ratio < 9.9 || ratio > 10.1 {
 		t.Fatalf("ratio = %v, want ~10 (c1=%v c10=%v)", ratio, c1, c10)
+	}
+}
+
+func TestEstimateLiveUsesLiveProviderBeforeStaticTable(t *testing.T) {
+	live := func(ctx context.Context, provider, model string) (LivePricing, bool) {
+		if provider != "anthropic" || model != "claude-opus-4-7" {
+			t.Fatalf("provider/model = %q/%q", provider, model)
+		}
+		return LivePricing{InputPerM: 5, OutputPerM: 25, Provider: "anthropic"}, true
+	}
+	cost, source, ok := EstimateLive(context.Background(), live, "pricepertoken", "claude-opus-4-7", 1000, 1000)
+	if !ok {
+		t.Fatalf("ok=false")
+	}
+	want := 0.03
+	if math.Abs(cost-want) > 0.0000001 {
+		t.Fatalf("cost=%v want %v", cost, want)
+	}
+	if source != "pricepertoken" {
+		t.Fatalf("source=%q want pricepertoken", source)
+	}
+}
+
+func TestEstimateLiveFallsBackToStaticEstimate(t *testing.T) {
+	live := func(ctx context.Context, provider, model string) (LivePricing, bool) {
+		return LivePricing{}, false
+	}
+	cost, source, ok := EstimateLive(context.Background(), live, "pricepertoken", "claude-opus-4-7", 1000, 1000)
+	if !ok {
+		t.Fatalf("ok=false")
+	}
+	want, _, _ := Estimate("claude-opus-4-7", 1000, 1000)
+	if math.Abs(cost-want) > 0.0000001 {
+		t.Fatalf("cost=%v want fallback %v", cost, want)
+	}
+	if source != "estimated" {
+		t.Fatalf("source=%q want estimated", source)
+	}
+}
+
+func TestEstimateUsageAppliesLiveCacheRates(t *testing.T) {
+	live := func(ctx context.Context, provider, model string) (LivePricing, bool) {
+		return LivePricing{InputPerM: 5, OutputPerM: 25, CacheReadPerM: 0.5, CacheWritePerM: 6.25}, true
+	}
+	usage := Usage{Input: 100, CacheCreation: 200, CacheRead: 300, Output: 400}
+	cost, source, ok := EstimateUsage(context.Background(), live, "pricepertoken", "claude-opus-4-7", usage)
+	if !ok {
+		t.Fatalf("ok=false")
+	}
+	want := 100*5.0/1_000_000 + 200*6.25/1_000_000 + 300*0.5/1_000_000 + 400*25.0/1_000_000
+	if math.Abs(cost-want) > 0.0000001 {
+		t.Fatalf("cost=%v want %v", cost, want)
+	}
+	if source != "pricepertoken" {
+		t.Fatalf("source=%q want pricepertoken", source)
 	}
 }

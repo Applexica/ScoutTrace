@@ -40,11 +40,21 @@ type CaptureWorker struct {
 	// StaticPrices is consulted when the response carries no reported cost
 	// and no model/tokens-derived estimate is available. May be nil.
 	StaticPrices StaticPriceLookup
+	// LivePrices is consulted between "reported" and "estimated" in the
+	// billing priority chain. A nil lookup keeps the legacy static-only
+	// behavior. LiveSource is the value written to BillingBlock.PricingSource
+	// on a live hit (typically "pricepertoken").
+	LivePrices LiveLookup
+	LiveSource string
 
 	// metrics
 	parseErrors uint64
 	dropped     uint64
 }
+
+// LiveLookup mirrors billing.LiveLookup so callers don't have to import the
+// billing package just to hand a live pricing function to the proxy.
+type LiveLookup = billing.LiveLookup
 
 // NewCaptureWorker constructs a worker with sensible defaults.
 func NewCaptureWorker(opts CaptureWorker) *CaptureWorker {
@@ -226,8 +236,14 @@ func (cw *CaptureWorker) emitToolCall(p jsonrpc.MatchedPair) {
 	// Best-effort billing extraction from the *raw* result before any
 	// truncation marker has been substituted in. Run on p.Result rather
 	// than resultBytes so we can recognise metadata even when capture is
-	// disabled or the body was truncated.
-	if bb := billing.Enrich(p.Result, cw.Session.ServerName, ev.Tool.Name, cw.StaticPrices); !bb.Empty() {
+	// disabled or the body was truncated. The live lookup is given a
+	// short-lived context so a slow PricePerToken response cannot stall
+	// capture; on timeout the call returns ok=false and falls through to
+	// the static estimate.
+	enrichCtx, enrichCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	bb := billing.EnrichLive(enrichCtx, p.Result, cw.Session.ServerName, ev.Tool.Name, cw.StaticPrices, cw.LivePrices, cw.LiveSource)
+	enrichCancel()
+	if !bb.Empty() {
 		ev.Billing = &event.BillingBlock{
 			CostUSD:       bb.CostUSD,
 			TokensIn:      bb.TokensIn,

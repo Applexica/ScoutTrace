@@ -89,6 +89,7 @@ func CmdProxy(ctx context.Context, g *Globals, args []string) int {
 			maxArg = c.Capture.MaxArgBytes
 			maxRes = c.Capture.MaxResultBytes
 		}
+		live, liveSource := c.LiveLookup()
 		worker = proxy.NewCaptureWorker(proxy.CaptureWorker{
 			Session:        sess,
 			Engine:         eng,
@@ -100,6 +101,8 @@ func CmdProxy(ctx context.Context, g *Globals, args []string) int {
 			MaxArgBytes:    maxArg,
 			MaxResultBytes: maxRes,
 			StaticPrices:   c.StaticPriceLookup(),
+			LivePrices:     live,
+			LiveSource:     liveSource,
 		})
 	}
 

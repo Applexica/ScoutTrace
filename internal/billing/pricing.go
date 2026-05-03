@@ -1,6 +1,9 @@
 package billing
 
-import "strings"
+import (
+	"context"
+	"strings"
+)
 
 // modelPrice is per-million-token pricing in USD for a model family.
 type modelPrice struct {
@@ -42,6 +45,32 @@ var pricingTable = []modelPrice{
 	{MatchSubstr: "o1", InputPerM: 15.0, OutputPerM: 60.0, Provider: "openai"},
 }
 
+// LivePricing is per-million-token pricing returned from a live provider. It
+// is intentionally a value type (no methods, no pointers) so it round-trips
+// safely through cache layers and is cheap to copy.
+type LivePricing struct {
+	InputPerM      float64
+	OutputPerM     float64
+	CacheReadPerM  float64
+	CacheWritePerM float64
+	Provider       string
+}
+
+// LiveLookup resolves a (provider, model) tuple to a LivePricing entry. ok
+// must be false on any failure (network, parse, unknown model, context
+// cancelled). Implementations live under internal/billing/livepricing.
+type LiveLookup func(ctx context.Context, provider, model string) (LivePricing, bool)
+
+// Usage breaks an LLM turn's input side into base + cache components so
+// EstimateUsage can apply per-component live prices when available. Output
+// tokens are billed at OutputPerM unconditionally.
+type Usage struct {
+	Input         int
+	CacheCreation int
+	CacheRead     int
+	Output        int
+}
+
 // LookupProvider returns the provider associated with a model id, or "" if
 // the model is not in the built-in table.
 func LookupProvider(model string) string {
@@ -65,6 +94,73 @@ func Estimate(model string, tokensIn, tokensOut int) (cost float64, source strin
 	}
 	cost = float64(tokensIn)*p.InputPerM/1_000_000 + float64(tokensOut)*p.OutputPerM/1_000_000
 	return cost, "estimated", true
+}
+
+// EstimateLive returns a cost-in-USD estimate trying the live provider first
+// and falling back to the built-in static table on any failure. The returned
+// source is the live provider's source identifier (liveSource) on a hit, or
+// "estimated" on fallback. ok=false means neither path produced a price.
+//
+// Cache breakdown is not visible at this layer; the full input total is
+// charged at InputPerM. Callers that have access to per-component token
+// deltas (for example the Claude transcript scanner) should use EstimateUsage
+// instead so cache rates are applied correctly.
+func EstimateLive(ctx context.Context, live LiveLookup, liveSource, model string, tokensIn, tokensOut int) (cost float64, source string, ok bool) {
+	if tokensIn <= 0 && tokensOut <= 0 {
+		return 0, "", false
+	}
+	if live != nil {
+		provider := LookupProvider(model)
+		if pr, hit := live(ctx, provider, model); hit {
+			cost = float64(tokensIn)*pr.InputPerM/1_000_000 + float64(tokensOut)*pr.OutputPerM/1_000_000
+			src := liveSource
+			if src == "" {
+				src = "live"
+			}
+			return cost, src, true
+		}
+	}
+	return Estimate(model, tokensIn, tokensOut)
+}
+
+// EstimateUsage returns a cost-in-USD estimate using a per-component Usage
+// breakdown. The live provider is tried first; on success, cache_creation
+// tokens are billed at CacheWritePerM and cache_read tokens at CacheReadPerM
+// (when the live source exposed those rates — otherwise they fall back to
+// InputPerM, which matches Anthropic's "no discount" semantics for unknown
+// caches better than charging $0/M would).
+//
+// On live failure or any time the live source returns ok=false, falls back to
+// the static pricing table charging the full input total at InputPerM. The
+// returned source is liveSource on a live hit or "estimated" on fallback.
+func EstimateUsage(ctx context.Context, live LiveLookup, liveSource, model string, u Usage) (cost float64, source string, ok bool) {
+	if u.Input <= 0 && u.CacheCreation <= 0 && u.CacheRead <= 0 && u.Output <= 0 {
+		return 0, "", false
+	}
+	if live != nil {
+		provider := LookupProvider(model)
+		if pr, hit := live(ctx, provider, model); hit {
+			cacheWrite := pr.CacheWritePerM
+			if cacheWrite <= 0 {
+				cacheWrite = pr.InputPerM
+			}
+			cacheRead := pr.CacheReadPerM
+			if cacheRead <= 0 {
+				cacheRead = pr.InputPerM
+			}
+			cost = float64(u.Input)*pr.InputPerM/1_000_000 +
+				float64(u.CacheCreation)*cacheWrite/1_000_000 +
+				float64(u.CacheRead)*cacheRead/1_000_000 +
+				float64(u.Output)*pr.OutputPerM/1_000_000
+			src := liveSource
+			if src == "" {
+				src = "live"
+			}
+			return cost, src, true
+		}
+	}
+	tokensIn := u.Input + u.CacheCreation + u.CacheRead
+	return Estimate(model, tokensIn, u.Output)
 }
 
 func lookup(model string) *modelPrice {

@@ -6,6 +6,7 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,8 +14,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/webhookscout/scouttrace/internal/billing"
+	"github.com/webhookscout/scouttrace/internal/billing/livepricing"
 )
 
 // Config is the top-level user config.
@@ -34,7 +37,8 @@ type Config struct {
 
 // CostConfig groups cost/billing knobs.
 type CostConfig struct {
-	ToolPrices []ToolPriceEntry `json:"tool_prices,omitempty"`
+	ToolPrices  []ToolPriceEntry  `json:"tool_prices,omitempty"`
+	LivePricing LivePricingConfig `json:"live_pricing,omitempty"`
 }
 
 // ToolPriceEntry configures a static per-tool cost. The first entry whose
@@ -47,6 +51,41 @@ type ToolPriceEntry struct {
 	CostUSD    float64 `json:"cost_usd"`
 	Provider   string  `json:"provider,omitempty"`
 	Model      string  `json:"model,omitempty"`
+}
+
+// LivePricingConfig controls the live model-pricing lookup that runs between
+// "reported" and "estimated" in the billing priority chain. When disabled
+// (Enabled=false) capture falls back to the built-in static table exactly as
+// before. The defaults — enabled, PricePerToken provider, 1.5s timeout, 24h
+// cache — give every ScoutTrace install live prices out of the box without
+// ever blocking event capture if the network is unavailable.
+type LivePricingConfig struct {
+	// Enabled toggles the live lookup. Pointer-typed so an unset field in JSON
+	// is distinguishable from an explicit false; a nil value defaults to true.
+	Enabled       *bool  `json:"enabled,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	URL           string `json:"url,omitempty"`
+	TimeoutMS     int    `json:"timeout_ms,omitempty"`
+	CacheTTLHours int    `json:"cache_ttl_hours,omitempty"`
+}
+
+// IsEnabled reports whether live pricing should run. Parsed configs default this
+// field to true in applyDefaults; a zero-value Config constructed directly in
+// tests remains disabled so unit tests do not unexpectedly make network calls.
+func (l LivePricingConfig) IsEnabled() bool {
+	if l.Enabled == nil {
+		return false
+	}
+	return *l.Enabled
+}
+
+// EffectiveProvider returns the configured provider name, defaulting to
+// "pricepertoken" so an empty config still selects the documented backend.
+func (l LivePricingConfig) EffectiveProvider() string {
+	if l.Provider == "" {
+		return "pricepertoken"
+	}
+	return l.Provider
 }
 
 // HostRef carries patch bookkeeping for a host.
@@ -171,6 +210,7 @@ func Parse(b []byte) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, newErr(ErrCodeConfigParse, err.Error())
 	}
+	c.applyDefaults()
 	if err := c.expand(); err != nil {
 		return nil, err
 	}
@@ -212,6 +252,13 @@ func trimSpaceBytes(b []byte) []byte {
 		break
 	}
 	return b[i:]
+}
+
+func (c *Config) applyDefaults() {
+	if c.Cost.LivePricing.Enabled == nil {
+		enabled := true
+		c.Cost.LivePricing.Enabled = &enabled
+	}
 }
 
 func stripBOM(b []byte) *bomReader {
@@ -303,6 +350,17 @@ func (c *Config) Validate() error {
 			return newErr(ErrCodeConfigParse, fmt.Sprintf("cost.tool_prices[%d]: cost_usd must be >= 0", i))
 		}
 	}
+	if lp := c.Cost.LivePricing; lp.IsEnabled() {
+		if p := lp.EffectiveProvider(); p != "pricepertoken" {
+			return newErr(ErrCodeConfigParse, fmt.Sprintf("cost.live_pricing.provider %q not supported (only pricepertoken)", p))
+		}
+		if lp.TimeoutMS < 0 {
+			return newErr(ErrCodeConfigParse, "cost.live_pricing.timeout_ms must be >= 0")
+		}
+		if lp.CacheTTLHours < 0 {
+			return newErr(ErrCodeConfigParse, "cost.live_pricing.cache_ttl_hours must be >= 0")
+		}
+	}
 	return nil
 }
 
@@ -320,6 +378,60 @@ func (c *Config) StaticPriceLookup() billing.StaticPriceLookup {
 			}
 		}
 		return billing.StaticPrice{}, false
+	}
+}
+
+// LiveLookup constructs a billing.LiveLookup backed by the configured live
+// pricing provider, plus the source identifier to record when a live hit
+// occurs. Returns nil, "" when live pricing is disabled or unconfigured.
+//
+// The returned lookup wraps the provider so tests can swap in a fake without
+// the rest of capture caring which backend is in use. The provider's own
+// cache memoizes per-process model lookups.
+func (c *Config) LiveLookup() (billing.LiveLookup, string) {
+	if c == nil {
+		return nil, ""
+	}
+	lp := c.Cost.LivePricing
+	if !lp.IsEnabled() {
+		return nil, ""
+	}
+	switch lp.EffectiveProvider() {
+	case "pricepertoken":
+		timeout := time.Duration(lp.TimeoutMS) * time.Millisecond
+		ttl := time.Duration(lp.CacheTTLHours) * time.Hour
+		if ttl == 0 {
+			ttl = 24 * time.Hour
+		}
+		p := livepricing.NewPricePerToken(livepricing.PricePerTokenOptions{
+			URL:      lp.URL,
+			Timeout:  timeout,
+			CacheTTL: ttl,
+		})
+		return wrapLiveProvider(p), p.Name()
+	default:
+		return nil, ""
+	}
+}
+
+// wrapLiveProvider adapts a livepricing.Provider into billing.LiveLookup. The
+// adapter exists so the billing package never has to import livepricing.
+func wrapLiveProvider(p livepricing.Provider) billing.LiveLookup {
+	if p == nil {
+		return nil
+	}
+	return func(ctx context.Context, provider, model string) (billing.LivePricing, bool) {
+		pr, ok := p.Lookup(ctx, provider, model)
+		if !ok {
+			return billing.LivePricing{}, false
+		}
+		return billing.LivePricing{
+			InputPerM:      pr.InputPerM,
+			OutputPerM:     pr.OutputPerM,
+			CacheReadPerM:  pr.CacheReadPerM,
+			CacheWritePerM: pr.CacheWritePerM,
+			Provider:       pr.Provider,
+		}, true
 	}
 }
 

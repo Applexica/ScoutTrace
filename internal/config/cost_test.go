@@ -72,3 +72,73 @@ func TestStaticPriceLookupNoMatchReturnsFalse(t *testing.T) {
 		t.Fatalf("expected no match")
 	}
 }
+
+func TestParseCostLivePricing(t *testing.T) {
+	src := `{
+		"destinations":[{"name":"a","type":"stdout"}],
+		"cost":{
+			"live_pricing":{
+				"enabled":true,
+				"provider":"pricepertoken",
+				"url":"https://api.pricepertoken.com/mcp/mcp",
+				"timeout_ms":750,
+				"cache_ttl_hours":12
+			}
+		}
+	}`
+	c, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	lp := c.Cost.LivePricing
+	if !lp.IsEnabled() {
+		t.Fatalf("live pricing should be enabled")
+	}
+	if lp.EffectiveProvider() != "pricepertoken" || lp.URL == "" || lp.TimeoutMS != 750 || lp.CacheTTLHours != 12 {
+		t.Fatalf("live pricing config = %#v", lp)
+	}
+}
+
+func TestLivePricingDefaultsEnabled(t *testing.T) {
+	c, err := Parse([]byte(`{"destinations":[{"name":"a","type":"stdout"}]}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !c.Cost.LivePricing.IsEnabled() {
+		t.Fatalf("live pricing should default enabled")
+	}
+	if c.Cost.LivePricing.EffectiveProvider() != "pricepertoken" {
+		t.Fatalf("provider = %q", c.Cost.LivePricing.EffectiveProvider())
+	}
+	lookup, source := c.LiveLookup()
+	if lookup == nil || source != "pricepertoken" {
+		t.Fatalf("LiveLookup = %v, %q; want non-nil, pricepertoken", lookup, source)
+	}
+}
+
+func TestLivePricingCanBeDisabled(t *testing.T) {
+	c, err := Parse([]byte(`{
+		"destinations":[{"name":"a","type":"stdout"}],
+		"cost":{"live_pricing":{"enabled":false}}
+	}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Cost.LivePricing.IsEnabled() {
+		t.Fatalf("live pricing should be disabled")
+	}
+	lookup, source := c.LiveLookup()
+	if lookup != nil || source != "" {
+		t.Fatalf("LiveLookup = %v, %q; want nil, empty", lookup, source)
+	}
+}
+
+func TestLivePricingRejectsUnsupportedProvider(t *testing.T) {
+	_, err := Parse([]byte(`{
+		"destinations":[{"name":"a","type":"stdout"}],
+		"cost":{"live_pricing":{"provider":"unknown"}}
+	}`))
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
