@@ -4,11 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -186,7 +191,7 @@ func claudeHookStop(ctx context.Context, g *Globals, args []string) int {
 		return 0
 	}
 
-	env, err := buildClaudeStopEvent(body, c, *hostVersion)
+	events, err := buildClaudeStopEvents(body, c, *hostVersion, g.Home)
 	if err != nil {
 		fmt.Fprintln(g.Stderr, "claude-hook:", err)
 		if *failClosed {
@@ -194,10 +199,12 @@ func claudeHookStop(ctx context.Context, g *Globals, args []string) int {
 		}
 		return 0
 	}
-	if env == nil {
-		// No assistant turn with billing metadata in transcript — nothing to record.
-		if g.Verbose > 0 {
-			fmt.Fprintln(g.Stderr, "claude-hook stop: no assistant turn with usage in transcript; skipping")
+	ids := make([]string, 0, len(events))
+	if len(events) == 0 {
+		if g.JSON {
+			_ = printJSON(g.Stdout, map[string]any{"ids": ids, "count": 0, "destination": dest}, false)
+		} else if g.Verbose > 0 {
+			fmt.Fprintln(g.Stderr, "claude-hook stop: no new assistant turns with usage in transcript; skipping")
 		}
 		return 0
 	}
@@ -210,25 +217,28 @@ func claudeHookStop(ctx context.Context, g *Globals, args []string) int {
 		}
 		return 0
 	}
-	payload, err := json.Marshal(env)
-	if err != nil {
-		fmt.Fprintln(g.Stderr, "claude-hook:", err)
-		if *failClosed {
-			return 1
+	for _, env := range events {
+		payload, err := json.Marshal(env)
+		if err != nil {
+			fmt.Fprintln(g.Stderr, "claude-hook:", err)
+			if *failClosed {
+				return 1
+			}
+			continue
 		}
-		return 0
-	}
-	if err := q.Enqueue(env.ID, dest, payload); err != nil {
-		fmt.Fprintln(g.Stderr, "claude-hook:", err)
-		if *failClosed {
-			return 1
+		if err := q.Enqueue(env.ID, dest, payload); err != nil {
+			fmt.Fprintln(g.Stderr, "claude-hook:", err)
+			if *failClosed {
+				return 1
+			}
+			continue
 		}
-		return 0
+		ids = append(ids, env.ID)
 	}
 	if g.JSON {
-		_ = printJSON(g.Stdout, map[string]string{"id": env.ID, "destination": dest}, false)
+		_ = printJSON(g.Stdout, map[string]any{"ids": ids, "count": len(ids), "destination": dest}, false)
 	} else if g.Verbose > 0 {
-		fmt.Fprintf(g.Stderr, "claude-hook: enqueued %s → %s\n", env.ID, dest)
+		fmt.Fprintf(g.Stderr, "claude-hook: enqueued %d llm_turn event(s) → %s\n", len(ids), dest)
 	}
 
 	if *flush {
@@ -242,13 +252,18 @@ func claudeHookStop(ctx context.Context, g *Globals, args []string) int {
 	return 0
 }
 
-// buildClaudeStopEvent reads the Claude Code Stop hook payload, locates the
-// latest assistant turn in the referenced transcript that carries both
-// message.usage and message.model, and returns an llm_turn ToolCallEvent
-// carrying just the billing metadata. It deliberately omits transcript user
-// or assistant content from Request/Response so prompts and replies are never
-// captured. Returns (nil, nil) when no qualifying assistant turn is present.
-func buildClaudeStopEvent(body []byte, c *config.Config, hostVersion string) (*event.ToolCallEvent, error) {
+// buildClaudeStopEvents reads the Claude Code Stop hook payload and emits one
+// llm_turn ToolCallEvent per NEW assistant transcript line that carries both
+// message.model and message.usage. A persistent per-transcript byte-offset
+// cursor under <scoutHome>/claude_hook/cursors/ ensures repeated Stop hook
+// invocations only enqueue events for lines appended since the last call —
+// without it, every Stop fires would re-emit the entire transcript.
+//
+// Each event carries only billing metadata; the transcript's user and
+// assistant content is never copied into Request/Response so prompts and
+// replies cannot leak into capture. Returns an empty slice when nothing new
+// is available.
+func buildClaudeStopEvents(body []byte, c *config.Config, hostVersion, scoutHome string) ([]*event.ToolCallEvent, error) {
 	var hp claudeStopHookPayload
 	if err := json.Unmarshal(body, &hp); err != nil {
 		return nil, fmt.Errorf("invalid Claude Code Stop hook JSON: %w", err)
@@ -256,18 +271,11 @@ func buildClaudeStopEvent(body []byte, c *config.Config, hostVersion string) (*e
 	if hp.TranscriptPath == "" {
 		return nil, fmt.Errorf("missing transcript_path")
 	}
-	model, usage, err := readLatestAssistantUsage(hp.TranscriptPath)
-	if err != nil {
-		return nil, err
-	}
-	if model == "" || len(usage) == 0 {
-		return nil, nil
-	}
 
-	syntheticRaw, err := json.Marshal(map[string]any{
-		"model": model,
-		"usage": json.RawMessage(usage),
-	})
+	cursorPath := claudeStopCursorPath(scoutHome, hp.SessionID, hp.TranscriptPath)
+	startOffset := readClaudeStopCursor(cursorPath)
+
+	turns, endOffset, err := readNewAssistantUsageLines(hp.TranscriptPath, startOffset)
 	if err != nil {
 		return nil, err
 	}
@@ -279,56 +287,101 @@ func buildClaudeStopEvent(body []byte, c *config.Config, hostVersion string) (*e
 	if sessionID == "" {
 		sessionID = event.NewULID()
 	}
-	now := time.Now().UTC()
-	ev := &event.ToolCallEvent{
-		ID:         event.NewULIDAt(now),
-		Schema:     event.SchemaVersion,
-		CapturedAt: now,
-		SessionID:  sessionID,
-		TraceID:    event.NewTraceID(),
-		SpanID:     event.NewSpanID(),
-		Source: event.SourceBlock{
-			Kind:              "claude_code_hook",
-			Host:              "claude-code",
-			HostVersion:       hostVersion,
-			ScoutTraceVersion: version.Version,
-		},
-		Server: event.ServerBlock{Name: serverName},
-		Tool:   event.ToolBlock{Name: toolName},
-		Request: event.RequestBlock{
-			JSONRPCID: "claude-code-hook",
-		},
-		Response: event.ResponseBlock{OK: true},
-		Timing:   event.TimingBlock{StartedAt: now, EndedAt: now, LatencyMS: 0},
-	}
-	if bb := billing.Enrich(syntheticRaw, serverName, toolName, staticLookup(c)); !bb.Empty() {
-		ev.Billing = eventBillingBlock(bb)
+
+	out := make([]*event.ToolCallEvent, 0, len(turns))
+	for _, t := range turns {
+		syntheticRaw, err := json.Marshal(map[string]any{
+			"model": t.Model,
+			"usage": json.RawMessage(t.Usage),
+		})
+		if err != nil {
+			return nil, err
+		}
+		now := time.Now().UTC()
+		ev := &event.ToolCallEvent{
+			ID:         event.NewULIDAt(now),
+			Schema:     event.SchemaVersion,
+			CapturedAt: now,
+			SessionID:  sessionID,
+			TraceID:    event.NewTraceID(),
+			SpanID:     event.NewSpanID(),
+			Source: event.SourceBlock{
+				Kind:              "claude_code_hook",
+				Host:              "claude-code",
+				HostVersion:       hostVersion,
+				ScoutTraceVersion: version.Version,
+			},
+			Server:   event.ServerBlock{Name: serverName},
+			Tool:     event.ToolBlock{Name: toolName},
+			Request:  event.RequestBlock{JSONRPCID: "claude-code-hook"},
+			Response: event.ResponseBlock{OK: true},
+			Timing:   event.TimingBlock{StartedAt: now, EndedAt: now, LatencyMS: 0},
+		}
+		if bb := billing.Enrich(syntheticRaw, serverName, toolName, staticLookup(c)); !bb.Empty() {
+			ev.Billing = eventBillingBlock(bb)
+		}
+		final, err := finalizeWithRedaction(ev, c)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, final)
 	}
 
-	return finalizeWithRedaction(ev, c)
+	// Always advance the cursor to the end of the consumed prefix, even when
+	// no qualifying assistant lines were present, so non-assistant lines do
+	// not get re-scanned on the next invocation.
+	if endOffset > startOffset {
+		_ = writeClaudeStopCursor(cursorPath, endOffset)
+	}
+
+	return out, nil
 }
 
-// readLatestAssistantUsage scans a Claude Code transcript JSONL file and
-// returns the model id and the raw usage object from the last line that
-// represents an assistant turn carrying both fields. Earlier assistant lines
-// are ignored — Claude Code emits incremental usage and we only want the
-// final, authoritative count for the turn.
-func readLatestAssistantUsage(path string) (string, json.RawMessage, error) {
+// claudeStopTurn is one assistant transcript entry's billing-relevant fields.
+type claudeStopTurn struct {
+	Model string
+	Usage json.RawMessage
+}
+
+// readNewAssistantUsageLines scans the transcript starting at startOffset and
+// returns one claudeStopTurn per fully-terminated assistant line carrying
+// model+usage. It returns the byte offset at the end of the last fully-read
+// line so callers can persist the cursor; partial trailing lines (no \n) are
+// not consumed and will be picked up on a future invocation.
+func readNewAssistantUsageLines(path string, startOffset int64) ([]claudeStopTurn, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", nil, fmt.Errorf("open transcript: %w", err)
+		return nil, 0, fmt.Errorf("open transcript: %w", err)
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	var (
-		lastModel string
-		lastUsage json.RawMessage
-	)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat transcript: %w", err)
+	}
+	if startOffset > info.Size() {
+		// File was truncated or rotated; reset.
+		startOffset = 0
+	}
+	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+		return nil, 0, fmt.Errorf("seek transcript: %w", err)
+	}
+
+	r := bufio.NewReader(f)
+	consumed := startOffset
+	var out []claudeStopTurn
+	for {
+		line, err := r.ReadBytes('\n')
+		if errors.Is(err, io.EOF) {
+			// Trailing partial line (no \n yet) — do not consume.
+			break
+		}
+		if err != nil {
+			return nil, 0, fmt.Errorf("read transcript: %w", err)
+		}
+		consumed += int64(len(line))
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
 			continue
 		}
 		var entry struct {
@@ -338,7 +391,7 @@ func readLatestAssistantUsage(path string) (string, json.RawMessage, error) {
 				Usage json.RawMessage `json:"usage"`
 			} `json:"message"`
 		}
-		if err := json.Unmarshal(line, &entry); err != nil {
+		if err := json.Unmarshal(trimmed, &entry); err != nil {
 			continue
 		}
 		if entry.Type != "assistant" {
@@ -347,13 +400,53 @@ func readLatestAssistantUsage(path string) (string, json.RawMessage, error) {
 		if entry.Message.Model == "" || len(entry.Message.Usage) == 0 || string(entry.Message.Usage) == "null" {
 			continue
 		}
-		lastModel = entry.Message.Model
-		lastUsage = append(lastUsage[:0], entry.Message.Usage...)
+		usageCopy := make(json.RawMessage, len(entry.Message.Usage))
+		copy(usageCopy, entry.Message.Usage)
+		out = append(out, claudeStopTurn{Model: entry.Message.Model, Usage: usageCopy})
 	}
-	if err := scanner.Err(); err != nil {
-		return "", nil, fmt.Errorf("read transcript: %w", err)
+	return out, consumed, nil
+}
+
+// claudeStopCursorPath derives a deterministic file path for the per-transcript
+// cursor. The hash mixes session id and transcript path so two sessions
+// pointing at the same path do not collide, and so the filename is filesystem-
+// safe regardless of the original transcript location.
+func claudeStopCursorPath(scoutHome, sessionID, transcriptPath string) string {
+	if scoutHome == "" {
+		return ""
 	}
-	return lastModel, lastUsage, nil
+	h := sha256.Sum256([]byte(sessionID + "::" + transcriptPath))
+	return filepath.Join(scoutHome, "claude_hook", "cursors", hex.EncodeToString(h[:])+".cursor")
+}
+
+// readClaudeStopCursor returns the previously-saved byte offset for path, or
+// 0 if no cursor exists or the on-disk content is unparsable.
+func readClaudeStopCursor(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// writeClaudeStopCursor persists the byte offset to the cursor file, creating
+// any missing parent directories. Errors are non-fatal (cursor will reset on
+// the next invocation), so callers may discard the return value.
+func writeClaudeStopCursor(path string, offset int64) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(strconv.FormatInt(offset, 10)), 0o600)
 }
 
 func buildClaudeHookEvent(body []byte, c *config.Config, hostVersion string) (*event.ToolCallEvent, error) {

@@ -114,6 +114,26 @@ func extractFromObject(o map[string]any) Block {
 		v := n
 		b.TokensIn = &v
 	}
+	// Anthropic-style usage splits prompt tokens across input_tokens,
+	// cache_creation_input_tokens, and cache_read_input_tokens. Sum those
+	// cache fields into TokensIn so the displayed/billed input total reflects
+	// all prompt tokens — otherwise tool-loop turns appear with input_tokens=1
+	// while the bulk of context shows up only under cache fields.
+	for _, key := range []string{"cache_creation_input_tokens", "cacheCreationInputTokens", "cache_read_input_tokens", "cacheReadInputTokens"} {
+		if v, ok := o[key]; ok {
+			n, ok := toInt(v)
+			if !ok {
+				continue
+			}
+			if b.TokensIn == nil {
+				vv := n
+				b.TokensIn = &vv
+			} else {
+				vv := *b.TokensIn + n
+				b.TokensIn = &vv
+			}
+		}
+	}
 	if n, ok := pickInt(o, tokensOutKeys); ok {
 		v := n
 		b.TokensOut = &v
@@ -185,16 +205,23 @@ func pickInt(o map[string]any, keys []string) (int, bool) {
 		if !ok {
 			continue
 		}
-		switch x := v.(type) {
-		case float64:
-			return int(x), true
-		case int:
-			return x, true
-		case json.Number:
-			n, err := x.Int64()
-			if err == nil {
-				return int(n), true
-			}
+		if n, ok := toInt(v); ok {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+func toInt(v any) (int, bool) {
+	switch x := v.(type) {
+	case float64:
+		return int(x), true
+	case int:
+		return x, true
+	case json.Number:
+		n, err := x.Int64()
+		if err == nil {
+			return int(n), true
 		}
 	}
 	return 0, false

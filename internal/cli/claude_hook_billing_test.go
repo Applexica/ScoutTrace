@@ -123,6 +123,7 @@ func indexOf(haystack, needle string) int {
 
 func TestClaudeHookStopBuildsLLMTurnEventFromTranscript(t *testing.T) {
 	dir := t.TempDir()
+	home := t.TempDir()
 	transcript := filepath.Join(dir, "session.jsonl")
 	content := `{"type":"user","message":{"role":"user","content":"my secret prompt with whs_test_abcdefghijklmnop"}}` + "\n" +
 		`{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-7","usage":{"input_tokens":2000,"output_tokens":1000},"content":"reply with sensitive data"}}` + "\n"
@@ -135,13 +136,14 @@ func TestClaudeHookStopBuildsLLMTurnEventFromTranscript(t *testing.T) {
 		"transcript_path": transcript,
 		"cwd":             dir,
 	})
-	ev, err := buildClaudeStopEvent(body, &config.Config{}, "")
+	events, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
 	if err != nil {
-		t.Fatalf("buildClaudeStopEvent: %v", err)
+		t.Fatalf("buildClaudeStopEvents: %v", err)
 	}
-	if ev == nil {
-		t.Fatalf("expected event, got nil")
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, want 1", len(events))
 	}
+	ev := events[0]
 	if ev.Source.Kind != "claude_code_hook" {
 		t.Fatalf("source.kind = %q, want claude_code_hook", ev.Source.Kind)
 	}
@@ -187,11 +189,15 @@ func TestClaudeHookStopBuildsLLMTurnEventFromTranscript(t *testing.T) {
 	}
 }
 
-func TestClaudeHookStopUsesLatestAssistantUsage(t *testing.T) {
+func TestClaudeHookStopBuildsOneEventPerAssistantLine(t *testing.T) {
 	dir := t.TempDir()
+	home := t.TempDir()
 	transcript := filepath.Join(dir, "session.jsonl")
-	content := `{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":5}}}` + "\n" +
-		`{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":777,"output_tokens":42}}}` + "\n"
+	content := `{"type":"user","message":{"role":"user","content":"hi"}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":5}}}` + "\n" +
+		`{"type":"user","message":{"role":"user","content":"again"}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":777,"output_tokens":42}}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":3,"output_tokens":1}}}` + "\n"
 	if err := os.WriteFile(transcript, []byte(content), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
 	}
@@ -200,23 +206,135 @@ func TestClaudeHookStopUsesLatestAssistantUsage(t *testing.T) {
 		"hook_event_name": "Stop",
 		"transcript_path": transcript,
 	})
-	ev, err := buildClaudeStopEvent(body, &config.Config{}, "")
+	events, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
 	if err != nil {
-		t.Fatalf("buildClaudeStopEvent: %v", err)
+		t.Fatalf("buildClaudeStopEvents: %v", err)
 	}
-	if ev == nil {
-		t.Fatalf("expected event, got nil")
+	if len(events) != 3 {
+		t.Fatalf("len(events) = %d, want 3 (one per assistant line)", len(events))
 	}
-	if ev.Billing == nil || ev.Billing.Model != "claude-sonnet-4-6" {
-		t.Fatalf("expected last assistant model claude-sonnet-4-6, got %+v", ev.Billing)
-	}
-	if ev.Billing.TokensIn == nil || *ev.Billing.TokensIn != 777 {
-		t.Fatalf("expected last-line input_tokens=777, got %v", ev.Billing.TokensIn)
+	wantModels := []string{"claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"}
+	wantTokensIn := []int{10, 777, 3}
+	wantTokensOut := []int{5, 42, 1}
+	seenIDs := map[string]bool{}
+	for i, ev := range events {
+		if ev.Billing == nil {
+			t.Fatalf("event %d billing nil", i)
+		}
+		if ev.Billing.Model != wantModels[i] {
+			t.Fatalf("event %d model = %q, want %q", i, ev.Billing.Model, wantModels[i])
+		}
+		if ev.Billing.TokensIn == nil || *ev.Billing.TokensIn != wantTokensIn[i] {
+			t.Fatalf("event %d tokens_in = %v, want %d", i, ev.Billing.TokensIn, wantTokensIn[i])
+		}
+		if ev.Billing.TokensOut == nil || *ev.Billing.TokensOut != wantTokensOut[i] {
+			t.Fatalf("event %d tokens_out = %v, want %d", i, ev.Billing.TokensOut, wantTokensOut[i])
+		}
+		if seenIDs[ev.ID] {
+			t.Fatalf("duplicate event ID %q across the batch", ev.ID)
+		}
+		seenIDs[ev.ID] = true
 	}
 }
 
-func TestClaudeHookStopReturnsNilWhenNoAssistantUsage(t *testing.T) {
+func TestClaudeHookStopSumsClaudeCacheTokensIntoTokensIn(t *testing.T) {
 	dir := t.TempDir()
+	home := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+	// Real Claude tool-loop transcripts often show input_tokens=1 with the
+	// bulk of context tokens billed under cache_creation/cache_read fields.
+	// The displayed/billed input total must include all three.
+	content := `{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":5000,"cache_read_input_tokens":3000,"output_tokens":214}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(content), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"session_id":      "sess",
+		"hook_event_name": "Stop",
+		"transcript_path": transcript,
+	})
+	events, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("buildClaudeStopEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.Billing == nil || ev.Billing.TokensIn == nil {
+		t.Fatalf("billing or tokens_in nil: %+v", ev.Billing)
+	}
+	want := 1 + 5000 + 3000
+	if *ev.Billing.TokensIn != want {
+		t.Fatalf("tokens_in = %d, want %d (input + cache_creation + cache_read)", *ev.Billing.TokensIn, want)
+	}
+	if ev.Billing.TokensOut == nil || *ev.Billing.TokensOut != 214 {
+		t.Fatalf("tokens_out = %v, want 214", ev.Billing.TokensOut)
+	}
+}
+
+func TestClaudeHookStopCursorSkipsAlreadyProcessedLines(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+	first := `{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":5}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(first), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"session_id":      "sess",
+		"hook_event_name": "Stop",
+		"transcript_path": transcript,
+	})
+	events1, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("first buildClaudeStopEvents: %v", err)
+	}
+	if len(events1) != 1 {
+		t.Fatalf("first call len(events) = %d, want 1", len(events1))
+	}
+
+	// Calling again with no new lines must return zero events.
+	events2, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("second buildClaudeStopEvents: %v", err)
+	}
+	if len(events2) != 0 {
+		t.Fatalf("second call (no new lines) len(events) = %d, want 0", len(events2))
+	}
+
+	// Append two new assistant lines and one user line; expect exactly 2 new events.
+	more := `{"type":"user","message":{"content":"continue"}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":50,"output_tokens":11}}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":99,"output_tokens":7}}}` + "\n"
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("append open: %v", err)
+	}
+	if _, err := f.WriteString(more); err != nil {
+		t.Fatalf("append write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("append close: %v", err)
+	}
+	events3, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("third buildClaudeStopEvents: %v", err)
+	}
+	if len(events3) != 2 {
+		t.Fatalf("third call len(events) = %d, want 2 (only new assistant lines)", len(events3))
+	}
+	if events3[0].Billing == nil || events3[0].Billing.Model != "claude-sonnet-4-6" {
+		t.Fatalf("third call event[0] model = %+v, want claude-sonnet-4-6", events3[0].Billing)
+	}
+	if events3[1].Billing == nil || events3[1].Billing.Model != "claude-opus-4-7" {
+		t.Fatalf("third call event[1] model = %+v, want claude-opus-4-7", events3[1].Billing)
+	}
+}
+
+func TestClaudeHookStopReturnsEmptyWhenNoAssistantUsage(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
 	transcript := filepath.Join(dir, "empty.jsonl")
 	if err := os.WriteFile(transcript, []byte(`{"type":"user","message":{"content":"hi"}}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
@@ -226,12 +344,101 @@ func TestClaudeHookStopReturnsNilWhenNoAssistantUsage(t *testing.T) {
 		"hook_event_name": "Stop",
 		"transcript_path": transcript,
 	})
-	ev, err := buildClaudeStopEvent(body, &config.Config{}, "")
+	events, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
 	if err != nil {
-		t.Fatalf("buildClaudeStopEvent: %v", err)
+		t.Fatalf("buildClaudeStopEvents: %v", err)
 	}
-	if ev != nil {
-		t.Fatalf("expected nil event when transcript has no assistant usage, got %+v", ev)
+	if len(events) != 0 {
+		t.Fatalf("expected no events when transcript has no assistant usage, got %d", len(events))
+	}
+}
+
+func TestClaudeHookStopMultiLineDoesNotLeakPromptOrAssistantContent(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+	content := `{"type":"user","message":{"role":"user","content":"my secret prompt with whs_test_abcdefghijklmnop"}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":5},"content":"first reply with sensitive data"}}` + "\n" +
+		`{"type":"user","message":{"role":"user","content":"another secret PROMPT_TWO_LEAK"}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"cache_read_input_tokens":2000,"output_tokens":3},"content":"second reply with REPLY_TWO_LEAK"}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(content), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"session_id":      "sess",
+		"hook_event_name": "Stop",
+		"transcript_path": transcript,
+	})
+	events, err := buildClaudeStopEvents(body, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("buildClaudeStopEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2", len(events))
+	}
+	for i, ev := range events {
+		raw, _ := json.Marshal(ev)
+		for _, leaked := range []string{
+			"secret prompt", "sensitive data",
+			"whs_test_abcdefghijklmnop",
+			"PROMPT_TWO_LEAK", "REPLY_TWO_LEAK",
+			"another secret",
+		} {
+			if contains(string(raw), leaked) {
+				t.Fatalf("event %d leaked %q from transcript:\n%s", i, leaked, raw)
+			}
+		}
+	}
+}
+
+func TestClaudeHookStopCLIJSONOutputIncludesIDsAndCount(t *testing.T) {
+	home := t.TempDir()
+	exit, _, stderr := runCLI(t, home, "init", "--yes", "--hosts", "none", "--destination", "stdout")
+	if exit != 0 {
+		t.Fatalf("init exit=%d stderr=%s", exit, stderr)
+	}
+	dir := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+	content := `{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":5}}}` + "\n" +
+		`{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"cache_creation_input_tokens":4000,"output_tokens":11}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(content), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"session_id":      "sess-json",
+		"hook_event_name": "Stop",
+		"transcript_path": transcript,
+	})
+	exit, stdout, stderr := runCLIWithInput(t, home, string(payload), "--json", "claude-hook", "stop", "--destination", "default")
+	if exit != 0 {
+		t.Fatalf("stop exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout not JSON: %v\n%s", err, stdout)
+	}
+	if out["destination"] != "default" {
+		t.Fatalf("destination = %v, want default", out["destination"])
+	}
+	count, ok := out["count"].(float64)
+	if !ok {
+		t.Fatalf("count missing or not numeric: %#v", out["count"])
+	}
+	if int(count) != 2 {
+		t.Fatalf("count = %v, want 2", count)
+	}
+	idsRaw, ok := out["ids"].([]any)
+	if !ok {
+		t.Fatalf("ids missing or not array: %#v", out["ids"])
+	}
+	if len(idsRaw) != 2 {
+		t.Fatalf("len(ids) = %d, want 2", len(idsRaw))
+	}
+	for i, v := range idsRaw {
+		s, _ := v.(string)
+		if s == "" {
+			t.Fatalf("ids[%d] empty: %#v", i, v)
+		}
 	}
 }
 
