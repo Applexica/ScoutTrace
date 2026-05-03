@@ -270,6 +270,53 @@ scouttrace doctor
 
 > Do not paste API keys into MCP host config files. ScoutTrace config stores credential references such as `env://...`, `keychain://...`, or `encfile://...`, not raw secrets. In the interactive wizard you may paste the WebhookScout API key at the credential prompt; ScoutTrace stores it securely and writes only a credential reference.
 
+
+### Generate a WebhookScout setup command from the Agent UI
+
+The safest way to configure ScoutTrace for WebhookScout is to let WebhookScout generate the command for the exact agent and API you want to use.
+
+1. Open [WebhookScout](https://www.webhookscout.com) and go to **Agents**.
+2. Select or create the agent that should receive ScoutTrace telemetry.
+3. Open the agent's **ScoutTrace Config** tab.
+4. In **Configure ScoutTrace**, choose:
+   - **Harness** — for example `Claude Code`, `Codex`, `Hermes`, or `OpenClaw`. Additional harnesses, including other ScoutTrace-supported hosts such as Cursor, can be added to the WebhookScout dropdown over time.
+   - **Existing API** — the WebhookScout API/credential/destination ScoutTrace should use for delivery.
+   - **Tool-call validation** — enable this only when you want ScoutTrace to validate protected tool calls through WebhookScout approval policies.
+   - Optional home/credential/patch options when you want isolated per-harness config.
+5. Copy the generated terminal command block and run it on the machine where the harness runs.
+6. Run the generated `scouttrace doctor` command, then trigger one tool call from the harness.
+7. Refresh the WebhookScout **ScoutTrace Config** tab to confirm the latest synced ScoutTrace configuration shows the selected harness, API, and validation state.
+
+WebhookScout generates commands with the selected agent ID and API ID already filled in. It should not display raw API keys in the command. If you choose environment-variable credential storage, the command uses a placeholder such as:
+
+```sh
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='<paste API key here>'
+```
+
+Example generated command block for a Codex setup with isolated ScoutTrace home:
+
+```sh
+export SCOUTTRACE_WEBHOOKSCOUT_API_KEY='<paste API key here>'
+
+scouttrace --home ~/.scouttrace-codex init \
+  --destination webhookscout \
+  --webhookscout-api https://api.webhookscout.com/api \
+  --webhookscout-api-id api_123 \
+  --agent-id agent_123 \
+  --auth-header-ref env://SCOUTTRACE_WEBHOOKSCOUT_API_KEY \
+  --hosts codex \
+  --tool-call-validation=true \
+  --yes
+
+scouttrace --home ~/.scouttrace-codex hosts patch --host codex
+scouttrace --home ~/.scouttrace-codex destination approve default
+scouttrace --home ~/.scouttrace-codex doctor
+```
+
+For Claude Code, WebhookScout may generate a `scouttrace claude-hook install ...` command instead of, or in addition to, host patching so built-in/plugin tool activity can be captured. For Codex, Hermes, and OpenClaw, the generated command normally uses the corresponding ScoutTrace host patcher.
+
+> Tool-call validation is effective only when the selected ScoutTrace destination is `webhookscout` **and** the generated command enables `--tool-call-validation=true`. If either condition is false, ScoutTrace continues capturing telemetry but does not call WebhookScout for approval validation.
+
 ### Updating ScoutTrace
 
 Updating has two parts: check what you have versus what is available, then upgrade by the same path you originally installed.
