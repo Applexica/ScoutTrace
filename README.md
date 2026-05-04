@@ -30,6 +30,8 @@ Then use Claude Code normally. Tool events appear in your WebhookScout **Agents*
 
 ![WebhookScout Agents view showing per-tool activity for a Claude Code session](docs/assets/webhookscout-agent-tools.png)
 
+![WebhookScout Agents view showing LLM cost and token-usage breakdowns for a Claude Code session](docs/assets/webhookscout-agent-llm.png)
+
 ### How it works
 
 ```mermaid
