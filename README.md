@@ -746,7 +746,13 @@ Codex can run hooks from `~/.codex/hooks.json`, but a `PostToolUse` hook is visi
 scouttrace codex-hook install --destination default
 ```
 
-The installer writes a `Stop` hook to `~/.codex/hooks.json` and removes older ScoutTrace `PostToolUse` entries plus legacy ScoutTrace `claude-hook stop` / stale `codex-hook stop` entries. To preview the JSON without touching disk:
+The default installer writes a `Stop` hook to `~/.codex/hooks.json` and removes older ScoutTrace `PostToolUse` entries plus legacy ScoutTrace `claude-hook stop` / stale `codex-hook stop` entries. If a project has its own `.codex/hooks.json`, repair that project-local file too:
+
+```sh
+scouttrace codex-hook install --scope project --project-dir "$PWD" --destination default
+```
+
+Use `--scope both` to write both the user hook and the selected project hook in one command. To preview the JSON without touching disk:
 
 ```sh
 scouttrace codex-hook snippet --destination default

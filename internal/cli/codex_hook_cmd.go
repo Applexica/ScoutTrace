@@ -676,32 +676,103 @@ func codexHookInstall(g *Globals, args []string) int {
 	fs := flag.NewFlagSet("codex-hook install", flag.ContinueOnError)
 	fs.SetOutput(g.Stderr)
 	path := fs.String("path", "", "Codex hooks.json path (default ~/.codex/hooks.json)")
+	scope := fs.String("scope", "user", "install target: user, project, or both")
+	projectDir := fs.String("project-dir", "", "project directory for --scope project/both (default cwd)")
 	dest := fs.String("destination", "", "destination name")
 	flush := fs.Bool("flush", true, "attempt dispatch from the hook after enqueue")
 	if err := fs.Parse(args); err != nil {
 		return 64
 	}
-	hooksPath := *path
-	if hooksPath == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Fprintln(g.Stderr, err)
-			return 1
-		}
-		hooksPath = filepath.Join(home, ".codex", "hooks.json")
-	}
-	stopCmd := codexHookCommand(g, *flush, *dest)
-	removed, err := installCodexStopHook(hooksPath, stopCmd)
+	hookPaths, err := codexHookInstallTargets(*path, *scope, *projectDir)
 	if err != nil {
 		fmt.Fprintln(g.Stderr, "codex-hook install:", err)
 		return 1
 	}
-	if removed > 0 {
-		fmt.Fprintf(g.Stdout, "Removed %d legacy ScoutTrace hook(s) from %s\n", removed, hooksPath)
+	stopCmd := codexHookCommand(g, *flush, *dest)
+	for _, hooksPath := range hookPaths {
+		removed, err := installCodexStopHook(hooksPath, stopCmd)
+		if err != nil {
+			fmt.Fprintln(g.Stderr, "codex-hook install:", err)
+			return 1
+		}
+		if removed > 0 {
+			fmt.Fprintf(g.Stdout, "Removed %d legacy ScoutTrace hook(s) from %s\n", removed, hooksPath)
+		}
+		fmt.Fprintf(g.Stdout, "Installed Codex Stop hook in %s\n", hooksPath)
 	}
-	fmt.Fprintf(g.Stdout, "Installed Codex Stop hook in %s\n", hooksPath)
 	fmt.Fprintln(g.Stdout, "Restart Codex or reopen the project for hook settings to take effect.")
 	return 0
+}
+
+func codexHookInstallTargets(path, scope, projectDir string) ([]string, error) {
+	if path != "" {
+		return []string{path}, nil
+	}
+	var targets []string
+	switch scope {
+	case "", "user", "global":
+		userPath, err := codexUserHooksPath()
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, userPath)
+	case "project", "local":
+		projectPath, err := codexProjectHooksPath(projectDir)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, projectPath)
+	case "both":
+		userPath, err := codexUserHooksPath()
+		if err != nil {
+			return nil, err
+		}
+		projectPath, err := codexProjectHooksPath(projectDir)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, userPath, projectPath)
+	default:
+		return nil, fmt.Errorf("unknown scope %q (want user, project, or both)", scope)
+	}
+	return dedupeStrings(targets), nil
+}
+
+func codexUserHooksPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".codex", "hooks.json"), nil
+}
+
+func codexProjectHooksPath(projectDir string) (string, error) {
+	dir := projectDir
+	if dir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		dir = cwd
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(abs, ".codex", "hooks.json"), nil
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func installCodexStopHook(path, stopCommand string) (int, error) {

@@ -59,6 +59,58 @@ func TestCodexHookInstallRemovesLegacyScoutTraceHooks(t *testing.T) {
 	}
 }
 
+func TestCodexHookInstallProjectScopeRepairsProjectHooks(t *testing.T) {
+	home := t.TempDir()
+	projectDir := t.TempDir()
+	hooksPath := filepath.Join(projectDir, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooksPath), 0o700); err != nil {
+		t.Fatalf("mkdir hooks dir: %v", err)
+	}
+	legacy := `{
+  "hooks": {
+    "PostToolUse": [
+      {"matcher":"*","hooks":[{"type":"command","command":"/opt/homebrew/bin/scouttrace --home /Users/me/.scouttrace claude-hook post-tool-use --destination default --flush"}]}
+    ],
+    "Stop": [
+      {"hooks":[{"type":"command","command":"/opt/homebrew/bin/scouttrace --home /Users/me/.scouttrace claude-hook stop --destination default --flush"}]}
+    ]
+  }
+}`
+	if err := os.WriteFile(hooksPath, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("write hooks: %v", err)
+	}
+
+	exit, stdout, stderr := runCLI(
+		t,
+		home,
+		"codex-hook",
+		"install",
+		"--scope",
+		"project",
+		"--project-dir",
+		projectDir,
+		"--destination",
+		"default",
+	)
+	if exit != 0 {
+		t.Fatalf("install exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	b, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatalf("read hooks: %v", err)
+	}
+	text := string(b)
+	if strings.Contains(text, "PostToolUse") || strings.Contains(text, "claude-hook") {
+		t.Fatalf("project legacy ScoutTrace hooks were not removed:\n%s", text)
+	}
+	if !strings.Contains(text, "codex-hook stop") {
+		t.Fatalf("project codex Stop hook missing after install:\n%s", text)
+	}
+	if !strings.Contains(stdout, hooksPath) {
+		t.Fatalf("install output did not mention project hooks path:\n%s", stdout)
+	}
+}
+
 func TestCodexHookStopBuildsToolAndLLMTurnEventsFromSession(t *testing.T) {
 	dir := t.TempDir()
 	home := t.TempDir()
