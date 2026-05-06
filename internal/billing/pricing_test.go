@@ -29,6 +29,8 @@ func TestEstimateMatchesByModelSubstring(t *testing.T) {
 		{"anthropic/claude-haiku-4-5", 1000, 1000},
 		{"claude-opus-4-7-1m", 1000, 1000},
 		{"gpt-4o-mini-2024-07-18", 1000, 1000},
+		{"gpt-5.5", 1000, 1000},
+		{"gpt-5.4-mini", 1000, 1000},
 	}
 	for _, tc := range cases {
 		t.Run(tc.model, func(t *testing.T) {
@@ -43,6 +45,14 @@ func TestEstimateMatchesByModelSubstring(t *testing.T) {
 				t.Fatalf("source = %q, want estimated", source)
 			}
 		})
+	}
+}
+
+func TestLookupProviderRecognizesCurrentOpenAIModels(t *testing.T) {
+	for _, model := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"} {
+		if got := LookupProvider(model); got != "openai" {
+			t.Fatalf("LookupProvider(%q) = %q, want openai", model, got)
+		}
 	}
 }
 

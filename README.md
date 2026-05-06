@@ -738,6 +738,22 @@ scouttrace --home ~/.scouttrace claude-hook post-tool-use --destination default 
 
 It converts Claude Code hook JSON into the same ScoutTrace `ToolCallEvent` envelope, marks the source as `claude_code_hook`, redacts `tool_input` and `tool_response`, enqueues the event, and performs a best-effort flush. This is the recommended path for observing Claude Code Playwright/browser activity and other built-in/plugin tools.
 
+#### Codex hooks for built-in tools and LLM usage
+
+Codex can run hooks from `~/.codex/hooks.json`, but a `PostToolUse` hook is visible in the Codex live stream after every tool call. For Codex, use ScoutTrace's Stop-only hook instead. It waits until Codex writes the session JSONL, then reconstructs tool calls and `token_count` LLM usage rows without adding a visible `PostToolUse` item after every action.
+
+```sh
+scouttrace codex-hook install --destination default
+```
+
+The installer writes a `Stop` hook to `~/.codex/hooks.json` and removes older ScoutTrace `PostToolUse` entries plus legacy ScoutTrace `claude-hook stop` / stale `codex-hook stop` entries. To preview the JSON without touching disk:
+
+```sh
+scouttrace codex-hook snippet --destination default
+```
+
+The Stop hook emits normal tool events from Codex `function_call` / `function_call_output` pairs and LLM events from Codex `token_count.last_token_usage` rows. LLM events include `model`, `provider`, token counts, and a cost estimate when ScoutTrace can price the model.
+
 #### `scouttrace hosts list|patch|unpatch` with WebhookScout
 
 Use this when the AI system stores MCP servers in a config file ScoutTrace can patch. Built-in host IDs work directly across JSON, TOML, and YAML host formats. ScoutTrace backs up the original file before patching; use `hosts unpatch` or `undo` to roll back.

@@ -8,10 +8,11 @@ import (
 // modelPrice is per-million-token pricing in USD for a model family.
 type modelPrice struct {
 	// MatchSubstr is matched case-insensitively against the model id.
-	MatchSubstr string
-	InputPerM   float64
-	OutputPerM  float64
-	Provider    string
+	MatchSubstr   string
+	InputPerM     float64
+	CacheReadPerM float64
+	OutputPerM    float64
+	Provider      string
 }
 
 // pricingTable is a small, deliberately conservative built-in catalogue of
@@ -36,6 +37,11 @@ var pricingTable = []modelPrice{
 	{MatchSubstr: "haiku", InputPerM: 1.0, OutputPerM: 5.0, Provider: "anthropic"},
 	{MatchSubstr: "opus", InputPerM: 15.0, OutputPerM: 75.0, Provider: "anthropic"},
 	// OpenAI.
+	{MatchSubstr: "gpt-5.5", InputPerM: 5.0, CacheReadPerM: 0.50, OutputPerM: 30.0, Provider: "openai"},
+	{MatchSubstr: "gpt-5.4-mini", InputPerM: 0.75, CacheReadPerM: 0.075, OutputPerM: 4.50, Provider: "openai"},
+	{MatchSubstr: "gpt-5.4", InputPerM: 2.50, CacheReadPerM: 0.25, OutputPerM: 15.0, Provider: "openai"},
+	{MatchSubstr: "gpt-5.2", InputPerM: 1.75, CacheReadPerM: 0.175, OutputPerM: 14.0, Provider: "openai"},
+	{MatchSubstr: "gpt-5", InputPerM: 1.25, CacheReadPerM: 0.125, OutputPerM: 10.0, Provider: "openai"},
 	{MatchSubstr: "gpt-4o-mini", InputPerM: 0.15, OutputPerM: 0.60, Provider: "openai"},
 	{MatchSubstr: "gpt-4o", InputPerM: 2.5, OutputPerM: 10.0, Provider: "openai"},
 	{MatchSubstr: "gpt-4-turbo", InputPerM: 10.0, OutputPerM: 30.0, Provider: "openai"},
@@ -160,7 +166,22 @@ func EstimateUsage(ctx context.Context, live LiveLookup, liveSource, model strin
 		}
 	}
 	tokensIn := u.Input + u.CacheCreation + u.CacheRead
-	return Estimate(model, tokensIn, u.Output)
+	if tokensIn <= 0 && u.Output <= 0 {
+		return 0, "", false
+	}
+	p := lookup(model)
+	if p == nil {
+		return 0, "", false
+	}
+	cacheRead := p.CacheReadPerM
+	if cacheRead <= 0 {
+		cacheRead = p.InputPerM
+	}
+	cost = float64(u.Input)*p.InputPerM/1_000_000 +
+		float64(u.CacheCreation)*p.InputPerM/1_000_000 +
+		float64(u.CacheRead)*cacheRead/1_000_000 +
+		float64(u.Output)*p.OutputPerM/1_000_000
+	return cost, "estimated", true
 }
 
 func lookup(model string) *modelPrice {
