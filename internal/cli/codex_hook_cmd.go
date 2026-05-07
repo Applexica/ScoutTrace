@@ -17,6 +17,7 @@ import (
 	"github.com/webhookscout/scouttrace/internal/billing"
 	"github.com/webhookscout/scouttrace/internal/config"
 	"github.com/webhookscout/scouttrace/internal/event"
+	"github.com/webhookscout/scouttrace/internal/queue"
 	"github.com/webhookscout/scouttrace/internal/version"
 )
 
@@ -26,12 +27,14 @@ import (
 // from the Codex session JSONL at the end of the turn/session.
 func CmdCodexHook(ctx context.Context, g *Globals, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(g.Stderr, "codex-hook: subcommand required (stop|install|snippet)")
+		fmt.Fprintln(g.Stderr, "codex-hook: subcommand required (stop|tail|install|snippet)")
 		return 64
 	}
 	switch args[0] {
 	case "stop":
 		return codexHookStop(ctx, g, args[1:])
+	case "tail":
+		return codexHookTail(ctx, g, args[1:])
 	case "install":
 		return codexHookInstall(g, args[1:])
 	case "snippet":
@@ -192,8 +195,173 @@ func buildCodexStopEvents(body []byte, c *config.Config, hostVersion, scoutHome 
 	return buildCodexSessionEvents(sessionPath, hp.SessionID, c, hostVersion, scoutHome)
 }
 
+func codexHookTail(ctx context.Context, g *Globals, args []string) int {
+	fs := flag.NewFlagSet("codex-hook tail", flag.ContinueOnError)
+	fs.SetOutput(g.Stderr)
+	destFlag := fs.String("destination", "", "destination name (defaults to config default)")
+	sessionPath := fs.String("session-path", "", "specific Codex session JSONL to tail")
+	interval := fs.Duration("interval", 2*time.Second, "poll interval for continuous tailing")
+	lookback := fs.Duration("lookback", 6*time.Hour, "tail sessions modified within this duration")
+	once := fs.Bool("once", false, "poll once and exit")
+	flush := fs.Bool("flush", true, "attempt dispatch after enqueue")
+	flushTimeout := fs.Duration("flush-timeout", 10*time.Second, "best-effort dispatch timeout per poll")
+	failClosed := fs.Bool("fail-closed", false, "return non-zero if capture or flush fails")
+	applyJSON := withSubJSON(fs, g)
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	applyJSON()
+	if *interval <= 0 {
+		fmt.Fprintln(g.Stderr, "codex-hook tail: --interval must be > 0")
+		return 64
+	}
+	if *flushTimeout <= 0 {
+		fmt.Fprintln(g.Stderr, "codex-hook tail: --flush-timeout must be > 0")
+		return 64
+	}
+
+	c, err := loadConfig(g)
+	if err != nil {
+		fmt.Fprintln(g.Stderr, err)
+		if *failClosed {
+			return 1
+		}
+		return 0
+	}
+	dest := *destFlag
+	if dest == "" {
+		dest = c.DefaultDestination
+	}
+	if dest == "" {
+		dest = "default"
+	}
+	q, err := openQueue(g, c)
+	if err != nil {
+		fmt.Fprintln(g.Stderr, "codex-hook tail:", err)
+		if *failClosed {
+			return 1
+		}
+		return 0
+	}
+
+	for {
+		ids, err := tailCodexSessionsOnce(ctx, g, c, q, codexTailOptions{
+			Destination:  dest,
+			SessionPath:  *sessionPath,
+			Lookback:     *lookback,
+			Flush:        *flush,
+			FlushTimeout: *flushTimeout,
+		})
+		if err != nil {
+			fmt.Fprintln(g.Stderr, "codex-hook tail:", err)
+			if *failClosed {
+				return 1
+			}
+		}
+		if g.JSON {
+			_ = printJSON(g.Stdout, map[string]any{"ids": ids, "count": len(ids), "destination": dest}, false)
+		} else if g.Verbose > 0 && len(ids) > 0 {
+			fmt.Fprintf(g.Stderr, "codex-hook tail: enqueued %d event(s) -> %s\n", len(ids), dest)
+		}
+		if *once {
+			return 0
+		}
+		timer := time.NewTimer(*interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0
+		case <-timer.C:
+		}
+	}
+}
+
+type codexTailOptions struct {
+	Destination  string
+	SessionPath  string
+	Lookback     time.Duration
+	Flush        bool
+	FlushTimeout time.Duration
+}
+
+func tailCodexSessionsOnce(ctx context.Context, g *Globals, c *config.Config, q *queue.Queue, opts codexTailOptions) ([]string, error) {
+	paths := []string{}
+	if opts.SessionPath != "" {
+		paths = append(paths, opts.SessionPath)
+	} else {
+		var err error
+		paths, err = recentCodexSessionPaths(opts.Lookback, time.Now())
+		if err != nil {
+			return nil, err
+		}
+	}
+	ids := []string{}
+	for _, path := range paths {
+		events, err := buildCodexSessionEvents(path, "", c, "", g.Home)
+		if err != nil {
+			return ids, err
+		}
+		for _, env := range events {
+			payload, err := json.Marshal(env)
+			if err != nil {
+				return ids, err
+			}
+			if err := q.Enqueue(env.ID, opts.Destination, payload); err != nil {
+				return ids, err
+			}
+			ids = append(ids, env.ID)
+		}
+	}
+	if opts.Flush {
+		if err := flushQueueOnce(ctx, g, c, q, opts.Destination, opts.FlushTimeout); err != nil {
+			return ids, err
+		}
+	}
+	return ids, nil
+}
+
+func recentCodexSessionPaths(lookback time.Duration, now time.Time) ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	pattern := filepath.Join(home, ".codex", "sessions", "*", "*", "*", "*.jsonl")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, err
+	}
+	cutoff := time.Time{}
+	if lookback > 0 {
+		cutoff = now.Add(-lookback)
+	}
+	type sessionFile struct {
+		path    string
+		modTime time.Time
+	}
+	files := make([]sessionFile, 0, len(matches))
+	for _, match := range matches {
+		info, err := os.Stat(match)
+		if err != nil {
+			continue
+		}
+		if !cutoff.IsZero() && info.ModTime().Before(cutoff) {
+			continue
+		}
+		files = append(files, sessionFile{path: match, modTime: info.ModTime()})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].modTime.Before(files[j].modTime)
+	})
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.path)
+	}
+	return paths, nil
+}
+
 type codexSessionCursor struct {
-	Offset int64 `json:"offset"`
+	Offset  int64              `json:"offset"`
+	Pending []codexPendingCall `json:"pending,omitempty"`
 }
 
 type codexSessionMetadata struct {
@@ -204,10 +372,10 @@ type codexSessionMetadata struct {
 }
 
 type codexPendingCall struct {
-	Name      string
-	Args      json.RawMessage
-	CallID    string
-	StartedAt time.Time
+	Name      string          `json:"name"`
+	Args      json.RawMessage `json:"args,omitempty"`
+	CallID    string          `json:"call_id"`
+	StartedAt time.Time       `json:"started_at"`
 }
 
 type codexTokenUsage struct {
@@ -319,6 +487,11 @@ func readNewCodexSessionEvents(path string, start codexSessionCursor, meta codex
 	r := bufio.NewReader(f)
 	end.Offset = start.Offset
 	pending := map[string]codexPendingCall{}
+	for _, call := range start.Pending {
+		if call.CallID != "" {
+			pending[call.CallID] = call
+		}
+	}
 	var out []*event.ToolCallEvent
 	for {
 		line, err := r.ReadBytes('\n')
@@ -355,7 +528,22 @@ func readNewCodexSessionEvents(path string, start codexSessionCursor, meta codex
 			}
 		}
 	}
+	end.Pending = pendingCallsSlice(pending)
 	return out, end, nil
+}
+
+func pendingCallsSlice(pending map[string]codexPendingCall) []codexPendingCall {
+	if len(pending) == 0 {
+		return nil
+	}
+	out := make([]codexPendingCall, 0, len(pending))
+	for _, call := range pending {
+		out = append(out, call)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CallID < out[j].CallID
+	})
+	return out
 }
 
 func handleCodexResponseItem(payload json.RawMessage, ts time.Time, pending map[string]codexPendingCall, meta codexSessionMetadata, c *config.Config) *event.ToolCallEvent {

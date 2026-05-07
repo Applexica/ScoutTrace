@@ -760,6 +760,14 @@ scouttrace codex-hook snippet --destination default
 
 The Stop hook emits normal tool events from Codex `function_call` / `function_call_output` pairs and LLM events from Codex `token_count.last_token_usage` rows. LLM events include `model`, `provider`, token counts, and a cost estimate when ScoutTrace can price the model.
 
+The Stop hook is quiet but only runs at Codex stop boundaries. For near-real-time telemetry while long tasks are still running, run a sidecar tailer in a terminal or launch agent:
+
+```sh
+scouttrace codex-hook tail --destination default --interval 2s --lookback 2h
+```
+
+The tailer watches recently modified `~/.codex/sessions/**/*.jsonl` files, reuses the same cursor files as the Stop hook, and flushes after each poll. Keep the Stop hook installed as a final catch-up pass when Codex finishes a turn or session.
+
 #### `scouttrace hosts list|patch|unpatch` with WebhookScout
 
 Use this when the AI system stores MCP servers in a config file ScoutTrace can patch. Built-in host IDs work directly across JSON, TOML, and YAML host formats. ScoutTrace backs up the original file before patching; use `hosts unpatch` or `undo` to roll back.

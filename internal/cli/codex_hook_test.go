@@ -191,3 +191,86 @@ func TestCodexHookStopCursorSkipsAlreadyProcessedRows(t *testing.T) {
 		t.Fatalf("second len = %d, want 0 after cursor", len(second))
 	}
 }
+
+func TestCodexHookCursorKeepsPendingCallAcrossPolls(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	sessionPath := filepath.Join(dir, "session.jsonl")
+	firstChunk := strings.Join([]string{
+		`{"timestamp":"2026-05-06T20:26:00.000Z","type":"session_meta","payload":{"id":"session-1","cli_version":"0.128.0-alpha.1","model_provider":"openai"}}`,
+		`{"timestamp":"2026-05-06T20:26:01.000Z","type":"turn_context","payload":{"model":"gpt-5.5"}}`,
+		`{"timestamp":"2026-05-06T20:26:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}","call_id":"call_1"}}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(sessionPath, []byte(firstChunk), 0o600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"session_id":      "session-1",
+		"hook_event_name": "Stop",
+		"transcript_path": sessionPath,
+	})
+	first, err := buildCodexStopEvents(body, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("first buildCodexStopEvents: %v", err)
+	}
+	if len(first) != 0 {
+		t.Fatalf("first len = %d, want 0 before tool output", len(first))
+	}
+	f, err := os.OpenFile(sessionPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	_, err = f.WriteString(`{"timestamp":"2026-05-06T20:26:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"{\"stdout\":\"/tmp\\n\",\"exit_code\":0}"}}` + "\n")
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("append output: %v", err)
+	}
+	second, err := buildCodexStopEvents(body, &config.Config{}, "", home)
+	if err != nil {
+		t.Fatalf("second buildCodexStopEvents: %v", err)
+	}
+	if len(second) != 1 {
+		t.Fatalf("second len = %d, want 1 after output", len(second))
+	}
+	if second[0].Tool.Name != "exec_command" {
+		t.Fatalf("tool = %q, want exec_command", second[0].Tool.Name)
+	}
+}
+
+func TestCodexHookTailOnceCapturesSessionPath(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	exit, stdout, stderr := runCLI(t, home, "init", "--yes", "--destination", "stdout", "--hosts", "none")
+	if exit != 0 {
+		t.Fatalf("init exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	sessionPath := filepath.Join(dir, "session.jsonl")
+	session := strings.Join([]string{
+		`{"timestamp":"2026-05-06T20:26:00.000Z","type":"session_meta","payload":{"id":"session-1","cli_version":"0.128.0-alpha.1","model_provider":"openai"}}`,
+		`{"timestamp":"2026-05-06T20:26:01.000Z","type":"turn_context","payload":{"model":"gpt-5.5"}}`,
+		`{"timestamp":"2026-05-06T20:26:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}","call_id":"call_1"}}`,
+		`{"timestamp":"2026-05-06T20:26:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"{\"stdout\":\"/tmp\\n\",\"exit_code\":0}"}}`,
+		`{"timestamp":"2026-05-06T20:26:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":50,"total_tokens":1050}}}}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(sessionPath, []byte(session), 0o600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+	exit, stdout, stderr = runCLI(t, home, "--json", "codex-hook", "tail", "--once", "--flush=false", "--session-path", sessionPath, "--destination", "default")
+	if exit != 0 {
+		t.Fatalf("tail exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"count": 2`) && !strings.Contains(stdout, `"count":2`) {
+		t.Fatalf("tail did not report two events:\nstdout=%s\nstderr=%s", stdout, stderr)
+	}
+	exit, stdout, stderr = runCLI(t, home, "queue", "stats")
+	if exit != 0 {
+		t.Fatalf("stats exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "pending=2") {
+		t.Fatalf("queue stats missing pending=2: %s", stdout)
+	}
+}
