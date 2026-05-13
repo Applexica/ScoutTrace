@@ -18,6 +18,7 @@ import (
 	"github.com/webhookscout/scouttrace/internal/destinations"
 	"github.com/webhookscout/scouttrace/internal/destinations/httpdest"
 	"github.com/webhookscout/scouttrace/internal/event"
+	"github.com/webhookscout/scouttrace/internal/halt"
 )
 
 // Config configures the WebhookScout adapter.
@@ -26,6 +27,12 @@ type Config struct {
 	APIBase       string // e.g. https://api.webhookscout.com
 	AgentID       string
 	AuthHeaderRef string // typically keychain://scouttrace/webhookscout/<name>
+	// HaltCache is optional. When provided, every successful ingest
+	// response is scanned for the WebhookScout cost-gate `halted` field
+	// and the cache is updated. Downstream consumers (the MCP proxy
+	// gate and the claude-hook pre-tool-use subcommand) read this cache
+	// to decide whether to refuse tool calls.
+	HaltCache *halt.Cache
 }
 
 // Adapter wraps httpdest.Adapter with WebhookScout MCP ingest semantics.
@@ -47,13 +54,17 @@ func New(cfg Config, res destinations.Resolver) (*Adapter, error) {
 		return nil, errors.New("webhookscout: agent_id required")
 	}
 	url := fmt.Sprintf("%s/api/mcp/%s/events", strings.TrimRight(cfg.APIBase, "/"), cfg.AgentID)
-	inner, err := httpdest.New(httpdest.Config{
+	innerCfg := httpdest.Config{
 		Name:          cfg.Name,
 		URL:           url,
 		AuthHeaderRef: cfg.AuthHeaderRef,
 		UseGzip:       true,
 		BodyEnvelope:  webhookScoutEventBody,
-	}, webhookScoutResolver(res))
+	}
+	if cfg.HaltCache != nil {
+		innerCfg.OnResponse = haltOnResponse(cfg.AgentID, cfg.HaltCache)
+	}
+	inner, err := httpdest.New(innerCfg, webhookScoutResolver(res))
 	if err != nil {
 		return nil, err
 	}
@@ -178,4 +189,34 @@ func mapToolCallEvent(raw json.RawMessage) ([]byte, error) {
 		}
 	}
 	return json.Marshal(out)
+}
+
+// ingestResponse mirrors the relevant fields of the WebhookScout
+// `/api/mcp/:agentId/events` response. Extra fields are ignored — the
+// JSON decoder tolerates them by default and the cost-gate contract is
+// limited to these three fields.
+type ingestResponse struct {
+	Halted              bool   `json:"halted"`
+	HaltReason          string `json:"haltReason"`
+	ManualClearRequired bool   `json:"manualClearRequired"`
+}
+
+func haltOnResponse(agentID string, cache *halt.Cache) func(status int, body []byte) {
+	return func(_ int, body []byte) {
+		if len(body) == 0 || cache == nil || agentID == "" {
+			return
+		}
+		var r ingestResponse
+		if err := json.Unmarshal(body, &r); err != nil {
+			return
+		}
+		// SetIfChanged keeps disk churn down to actual state transitions.
+		// Errors persisting the file are swallowed; the in-memory state
+		// is still updated and the next event will retry.
+		_, _ = cache.SetIfChanged(agentID, halt.State{
+			Halted:              r.Halted,
+			HaltReason:          r.HaltReason,
+			ManualClearRequired: r.ManualClearRequired,
+		})
+	}
 }

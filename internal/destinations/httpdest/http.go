@@ -14,7 +14,12 @@ import (
 	"time"
 
 	"github.com/webhookscout/scouttrace/internal/destinations"
+	"github.com/webhookscout/scouttrace/internal/version"
 )
+
+// versionTag is the ScoutTrace build version embedded in the User-Agent
+// header. Read once at package init so tests are stable.
+var versionTag = version.Version
 
 // Config configures an HTTP adapter.
 type Config struct {
@@ -27,6 +32,12 @@ type Config struct {
 	TLSTimeoutMS  int
 	UseGzip       bool
 	BodyEnvelope  func(events []byte) ([]byte, error) // optional override
+	// OnResponse, if set, is called with the raw response body and HTTP
+	// status for every successful (2xx) request. Used by the WebhookScout
+	// adapter to scan for the `halted` flag returned by the cost-gate
+	// evaluator. Never called for non-2xx responses. Implementations must
+	// not block; they run inline on the dispatch goroutine.
+	OnResponse func(status int, body []byte)
 }
 
 // Adapter implements destinations.Adapter for HTTP.
@@ -112,7 +123,7 @@ func (a *Adapter) Send(ctx context.Context, b destinations.Batch) destinations.R
 		req.Header.Set("Content-Encoding", "gzip")
 	}
 	req.Header.Set("Idempotency-Key", b.ID)
-	req.Header.Set("User-Agent", "ScoutTrace/0.1.0")
+	req.Header.Set("User-Agent", "ScoutTrace/"+versionTag)
 	for k, v := range a.headers {
 		req.Header.Set(k, v)
 	}
@@ -125,8 +136,27 @@ func (a *Adapter) Send(ctx context.Context, b destinations.Batch) destinations.R
 		return destinations.Result{Retriable: true, Err: err}
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	// Only read the body when an OnResponse callback wants it AND the
+	// request succeeded. A short cap keeps malicious or oversized
+	// responses from blowing memory; ingest responses are kilobytes at
+	// most.
+	if a.cfg.OnResponse != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		const maxResponseRead = 64 * 1024
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseRead))
+		// Drain any remainder so the connection can be reused.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		// Run callback inside a recover so a misbehaving handler can't
+		// crash the dispatcher.
+		safeOnResponse(a.cfg.OnResponse, resp.StatusCode, body)
+	} else {
+		io.Copy(io.Discard, resp.Body)
+	}
 	return interpret(resp)
+}
+
+func safeOnResponse(fn func(int, []byte), status int, body []byte) {
+	defer func() { _ = recover() }()
+	fn(status, body)
 }
 
 // Close releases the HTTP client (no-op for stdlib transport).

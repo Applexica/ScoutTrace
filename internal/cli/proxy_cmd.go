@@ -11,11 +11,48 @@ import (
 	"github.com/webhookscout/scouttrace/internal/config"
 	"github.com/webhookscout/scouttrace/internal/dispatch"
 	"github.com/webhookscout/scouttrace/internal/event"
+	"github.com/webhookscout/scouttrace/internal/halt"
 	"github.com/webhookscout/scouttrace/internal/proxy"
 	"github.com/webhookscout/scouttrace/internal/queue"
 	"github.com/webhookscout/scouttrace/internal/redact"
+	"github.com/webhookscout/scouttrace/internal/version"
 	"github.com/webhookscout/scouttrace/internal/wire"
 )
+
+// versionString returns the build version, used when stamping each
+// envelope's source.scouttrace_version.
+func versionString() string { return version.Version }
+
+// haltGateAdapter bridges the halt-package gate (which is wire-agnostic
+// to avoid an import cycle) into a wire.Gate the proxy can consume.
+type haltGateAdapter struct{ inner *halt.Gate }
+
+func (a haltGateAdapter) Inspect(frame []byte) wire.Decision {
+	if a.inner == nil {
+		return wire.Allow()
+	}
+	forward, reply, capture := a.inner.Decide(frame)
+	return wire.Decision{Forward: forward, Reply: reply, Capture: capture}
+}
+
+// resolveAgentIDForGate returns the WebhookScout agent ID for the
+// default destination, or empty when no webhookscout destination is
+// configured (gate becomes a no-op).
+func resolveAgentIDForGate(c *config.Config) string {
+	if c == nil {
+		return ""
+	}
+	want := c.DefaultDestination
+	for _, d := range c.Destinations {
+		if d.Type != "webhookscout" {
+			continue
+		}
+		if want == "" || d.Name == want {
+			return d.AgentID
+		}
+	}
+	return ""
+}
 
 // capturePolicyFromConfig converts the user's capture.servers config into
 // a redact.CapturePolicy that the worker can consult before any args/result
@@ -104,7 +141,7 @@ func CmdProxy(ctx context.Context, g *Globals, args []string) int {
 			Queue:          q,
 			Destination:    dest,
 			Host:           "unknown",
-			ScoutVersion:   "0.1.0",
+			ScoutVersion:   versionString(),
 			MaxArgBytes:    maxArg,
 			MaxResultBytes: maxRes,
 			StaticPrices:   staticPrices,
@@ -131,6 +168,18 @@ func CmdProxy(ctx context.Context, g *Globals, args []string) int {
 		dispatcherDrain = startInProxyDispatcher(dctx, g, c, q)
 	}
 
+	// Halt enforcement: when a WebhookScout destination is configured,
+	// install a gate that refuses host→up `tools/call` frames whenever
+	// the in-memory halt cache marks the agent as halted. The cache is
+	// populated from ingest responses by the WebhookScout destination
+	// adapter (shared `*halt.Cache` injected via newHaltCache).
+	var hostGate wire.Gate
+	if haltCache := newHaltCache(g); haltCache != nil {
+		if agentID := resolveAgentIDForGate(c); agentID != "" {
+			hostGate = haltGateAdapter{inner: &halt.Gate{Cache: haltCache, AgentID: agentID}}
+		}
+	}
+
 	exit, err := proxy.Run(ctx, proxy.Options{
 		ServerName: *serverName,
 		Upstream:   rest,
@@ -139,6 +188,7 @@ func CmdProxy(ctx context.Context, g *Globals, args []string) int {
 		Stderr:     g.Stderr,
 		CaptureCh:  capCh,
 		Worker:     workerArg,
+		HostGate:   hostGate,
 	})
 	if err != nil {
 		fmt.Fprintln(g.Stderr, "proxy:", err)
@@ -163,7 +213,7 @@ func startInProxyDispatcher(ctx context.Context, g *Globals, c *config.Config, q
 		fmt.Fprintf(g.Stderr, "proxy: in-process dispatcher disabled — %v\n", err)
 		return func() {}
 	}
-	reg, err := buildRegistry(c, newResolver(g))
+	reg, err := buildRegistry(c, newResolver(g), newHaltCache(g))
 	if err != nil {
 		fmt.Fprintf(g.Stderr, "proxy: dispatcher build failed: %v\n", err)
 		return func() {}

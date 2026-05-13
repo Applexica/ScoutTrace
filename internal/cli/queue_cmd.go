@@ -185,7 +185,7 @@ func queueFlush(g *Globals, args []string) int {
 		fmt.Fprintln(g.Stderr, err)
 		return 1
 	}
-	reg, err := buildRegistry(c, newResolver(g))
+	reg, err := buildRegistry(c, newResolver(g), newHaltCache(g))
 	if err != nil {
 		fmt.Fprintln(g.Stderr, err)
 		return 1

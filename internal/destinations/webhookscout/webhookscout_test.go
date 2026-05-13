@@ -12,6 +12,7 @@ import (
 
 	"github.com/webhookscout/scouttrace/internal/destinations"
 	"github.com/webhookscout/scouttrace/internal/event"
+	"github.com/webhookscout/scouttrace/internal/halt"
 )
 
 type staticResolver map[string]string
@@ -223,5 +224,55 @@ func TestWebhookScoutSendsEachBatchEventSeparately(t *testing.T) {
 	}
 	if hits != 2 {
 		t.Fatalf("hits = %d, want 2", hits)
+	}
+}
+
+func TestWebhookScoutReadsHaltFromResponseAndUpdatesCache(t *testing.T) {
+	// Server returns a halted=true payload; the adapter should parse it
+	// and update the injected halt cache so the proxy gate (next event)
+	// refuses outbound tool calls.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"eventId":"evt-1","halted":true,"haltReason":"Hourly cap of $5.00 crossed.","manualClearRequired":false}`))
+	}))
+	defer srv.Close()
+
+	cache := halt.NewCache("")
+	a, err := New(Config{Name: "default", APIBase: srv.URL, AgentID: "agent-1", HaltCache: cache}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	res := a.Send(context.Background(), destinations.Batch{ID: "batch-1", Events: []json.RawMessage{testToolCallEvent(t, true)}, PreparedAt: time.Now()})
+	if !res.OK {
+		t.Fatalf("Send result = %+v", res)
+	}
+	state := cache.Get("agent-1")
+	if !state.Halted {
+		t.Fatalf("cache.Halted = false, want true: %+v", state)
+	}
+	if state.HaltReason != "Hourly cap of $5.00 crossed." {
+		t.Fatalf("HaltReason = %q", state.HaltReason)
+	}
+}
+
+func TestWebhookScoutClearsCacheWhenIngestReturnsUnhalted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"eventId":"evt-2","halted":false}`))
+	}))
+	defer srv.Close()
+
+	cache := halt.NewCache("")
+	_ = cache.Set("agent-1", halt.State{Halted: true, HaltReason: "stale"})
+	a, err := New(Config{Name: "default", APIBase: srv.URL, AgentID: "agent-1", HaltCache: cache}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	res := a.Send(context.Background(), destinations.Batch{ID: "batch-2", Events: []json.RawMessage{testToolCallEvent(t, true)}, PreparedAt: time.Now()})
+	if !res.OK {
+		t.Fatalf("Send result = %+v", res)
+	}
+	if cache.Get("agent-1").Halted {
+		t.Fatalf("expected cache cleared")
 	}
 }

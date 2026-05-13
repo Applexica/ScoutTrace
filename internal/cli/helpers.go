@@ -17,6 +17,7 @@ import (
 	"github.com/webhookscout/scouttrace/internal/destinations/httpdest"
 	"github.com/webhookscout/scouttrace/internal/destinations/stdoutdest"
 	"github.com/webhookscout/scouttrace/internal/destinations/webhookscout"
+	"github.com/webhookscout/scouttrace/internal/halt"
 	"github.com/webhookscout/scouttrace/internal/queue"
 )
 
@@ -84,7 +85,13 @@ func valIfTrueStr(c *config.Config, f func(*config.Config) string) string {
 }
 
 // buildRegistry constructs the destination registry from config.
-func buildRegistry(c *config.Config, res destinations.Resolver) (*destinations.Registry, error) {
+//
+// When haltCache is non-nil, every WebhookScout destination is wired
+// with an OnResponse callback that scans the ingest response for the
+// cost-gate `halted` field and updates the cache. Pass nil to skip
+// halt enforcement (e.g. for the doctor / queue / start commands that
+// don't run the proxy or hook flow).
+func buildRegistry(c *config.Config, res destinations.Resolver, haltCache *halt.Cache) (*destinations.Registry, error) {
 	reg := destinations.NewRegistry()
 	for i := range c.Destinations {
 		d := c.Destinations[i]
@@ -119,7 +126,11 @@ func buildRegistry(c *config.Config, res destinations.Resolver) (*destinations.R
 			}
 		case "webhookscout":
 			a, err := webhookscout.New(webhookscout.Config{
-				Name: d.Name, APIBase: d.APIBase, AgentID: d.AgentID, AuthHeaderRef: d.AuthHeaderRef,
+				Name:          d.Name,
+				APIBase:       d.APIBase,
+				AgentID:       d.AgentID,
+				AuthHeaderRef: d.AuthHeaderRef,
+				HaltCache:     haltCache,
 			}, res)
 			if err != nil {
 				return nil, err
@@ -132,6 +143,19 @@ func buildRegistry(c *config.Config, res destinations.Resolver) (*destinations.R
 		}
 	}
 	return reg, nil
+}
+
+// newHaltCache returns the canonical halt-state cache for this
+// invocation. Returns nil only if g.Home is empty (e.g. a unit-test
+// fixture); in normal use it always returns a usable cache. Multiple
+// in-process calls share the same map via the file path on disk; a
+// fresh `*halt.Cache` per call is fine since the underlying file is
+// the source of truth.
+func newHaltCache(g *Globals) *halt.Cache {
+	if g == nil || g.Home == "" {
+		return nil
+	}
+	return halt.NewCache(halt.DefaultPath(g.Home))
 }
 
 // newResolver returns the credential resolver for this run.

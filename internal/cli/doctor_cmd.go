@@ -65,7 +65,7 @@ func CmdDoctor(ctx context.Context, g *Globals, args []string) int {
 	}
 	// 3. Destinations: try to construct adapters; we don't actually send.
 	if c != nil {
-		_, err := buildRegistry(c, newResolver(g))
+		_, err := buildRegistry(c, newResolver(g), newHaltCache(g))
 		if err != nil {
 			add("destinations", false, err.Error())
 		} else {

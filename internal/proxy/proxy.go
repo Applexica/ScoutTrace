@@ -28,6 +28,12 @@ type Options struct {
 	OnReady    func(*event.SessionState)
 	Logger     func(format string, args ...any)
 	GraceMS    int
+	// HostGate, when non-nil, runs on every host→upstream frame. When it
+	// returns a Block decision the frame is NOT forwarded and the gate's
+	// synthetic reply is written back to the host as if upstream had
+	// responded. This is how cost-gate halts refuse outbound tools/call
+	// in v0.6.
+	HostGate wire.Gate
 }
 
 // Run executes the proxy until either the host or upstream closes its side.
@@ -67,8 +73,18 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if captureEnabled {
 		capForWire = opts.CaptureCh
 	}
+	// Shared mutex for writes to host stdout. When a gate refuses a
+	// host→up frame and writes a synthetic reply back, we must not
+	// interleave with the legitimate upstream→host Tee. The Tee writes
+	// directly to opts.HostStdout, so we wrap it in a locked writer
+	// when a gate is present.
+	var hostStdoutLock sync.Mutex
+	hostStdoutForTee := opts.HostStdout
+	if opts.HostGate != nil {
+		hostStdoutForTee = &lockedWriter{W: opts.HostStdout, L: &hostStdoutLock}
+	}
 	hostToUp := &wire.Tee{Src: opts.HostStdin, Dst: upStdin, Dir: wire.DirHostToUpstream, CapCh: capForWire, Stats: stats}
-	upToHost := &wire.Tee{Src: upStdout, Dst: opts.HostStdout, Dir: wire.DirUpstreamToHost, CapCh: capForWire, Stats: stats}
+	upToHost := &wire.Tee{Src: upStdout, Dst: hostStdoutForTee, Dir: wire.DirUpstreamToHost, CapCh: capForWire, Stats: stats}
 
 	workerCtx, workerCancel := context.WithCancel(ctx)
 	defer workerCancel()
@@ -103,7 +119,25 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		err := hostToUp.Run()
+		var err error
+		if opts.HostGate != nil {
+			// Use the frame-aware forwarder so we can refuse forwarding
+			// when the gate says so (halt enforcement). The forwarder
+			// reads from the same pipeR used by Tee so the upstream-
+			// closed shutdown path stays identical.
+			fwd := &wire.GatedForwarder{
+				Src:          pipeR,
+				Upstream:     upStdin,
+				HostBack:     opts.HostStdout,
+				HostBackLock: &hostStdoutLock,
+				Gate:         opts.HostGate,
+				CapCh:        capForWire,
+				Stats:        stats,
+			}
+			err = fwd.Run()
+		} else {
+			err = hostToUp.Run()
+		}
 		_ = upStdin.Close()
 		errCh <- err
 	}()
@@ -162,6 +196,20 @@ func cmdExit(cmd *exec.Cmd) int {
 		return 0
 	}
 	return cmd.ProcessState.ExitCode()
+}
+
+// lockedWriter serializes writes so the upstream→host Tee can't
+// interleave with synthetic replies the GatedForwarder writes when it
+// refuses a host→upstream frame.
+type lockedWriter struct {
+	W io.Writer
+	L *sync.Mutex
+}
+
+func (lw *lockedWriter) Write(p []byte) (int, error) {
+	lw.L.Lock()
+	defer lw.L.Unlock()
+	return lw.W.Write(p)
 }
 
 // MustGetenv panics if the supplied env variable is missing. Used for early

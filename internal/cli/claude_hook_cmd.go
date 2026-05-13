@@ -21,6 +21,7 @@ import (
 	"github.com/webhookscout/scouttrace/internal/config"
 	"github.com/webhookscout/scouttrace/internal/dispatch"
 	"github.com/webhookscout/scouttrace/internal/event"
+	"github.com/webhookscout/scouttrace/internal/halt"
 	"github.com/webhookscout/scouttrace/internal/queue"
 	"github.com/webhookscout/scouttrace/internal/redact"
 	"github.com/webhookscout/scouttrace/internal/version"
@@ -33,12 +34,14 @@ import (
 // PostToolUse hook is the reliable capture point for those tool executions.
 func CmdClaudeHook(ctx context.Context, g *Globals, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(g.Stderr, "claude-hook: subcommand required (post-tool-use|stop|install|snippet)")
+		fmt.Fprintln(g.Stderr, "claude-hook: subcommand required (post-tool-use|pre-tool-use|stop|install|snippet)")
 		return 64
 	}
 	switch args[0] {
 	case "post-tool-use":
 		return claudeHookPostToolUse(ctx, g, args[1:])
+	case "pre-tool-use":
+		return claudeHookPreToolUse(g, args[1:])
 	case "stop":
 		return claudeHookStop(ctx, g, args[1:])
 	case "install":
@@ -49,6 +52,79 @@ func CmdClaudeHook(ctx context.Context, g *Globals, args []string) int {
 		fmt.Fprintf(g.Stderr, "claude-hook: unknown subcommand %q\n", args[0])
 		return 64
 	}
+}
+
+// claudeHookPreToolUse implements the Claude Code PreToolUse hook that
+// blocks the next tool invocation when the active agent has been halted
+// by a WebhookScout cost gate. It reads the halt-state cache (populated
+// by the dispatcher) and prints a JSON `decision: block` payload back
+// to Claude Code; otherwise it stays silent so the tool proceeds.
+//
+// Claude Code's PreToolUse hook protocol: a hook may emit a JSON object
+// on stdout to influence the tool call. `decision: "block"` aborts the
+// tool with the supplied reason surfaced to the model. Any other output
+// (including nothing) lets the call proceed.
+func claudeHookPreToolUse(g *Globals, args []string) int {
+	fs := flag.NewFlagSet("claude-hook pre-tool-use", flag.ContinueOnError)
+	fs.SetOutput(g.Stderr)
+	failOpen := fs.Bool("fail-open", true, "let tool calls proceed when halt state is unavailable")
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	// Drain stdin so Claude Code doesn't see a broken pipe; we don't
+	// actually need the payload — the halt decision is global per agent.
+	_, _ = io.Copy(io.Discard, g.Stdin)
+
+	c, err := loadConfig(g)
+	if err != nil {
+		if !*failOpen {
+			fmt.Fprintln(g.Stderr, "claude-hook:", err)
+			return 1
+		}
+		return 0
+	}
+	agentID := resolveClaudeHookAgentID(c)
+	if agentID == "" {
+		// No webhookscout destination configured — nothing to enforce.
+		return 0
+	}
+	cache := halt.NewCache(halt.DefaultPath(g.Home))
+	state := cache.Get(agentID)
+	if !state.Halted {
+		return 0
+	}
+	reason := state.HaltReason
+	if reason == "" {
+		reason = "WebhookScout cost gate halt"
+	}
+	suffix := ""
+	if state.ManualClearRequired {
+		suffix = " (manual clear required in WebhookScout)"
+	} else {
+		suffix = " (auto-clears at next hourly window rollover)"
+	}
+	payload := map[string]any{
+		"decision": "block",
+		"reason":   fmt.Sprintf("WebhookScout cost gate halt: %s%s", reason, suffix),
+	}
+	_ = json.NewEncoder(g.Stdout).Encode(payload)
+	return 0
+}
+
+func resolveClaudeHookAgentID(c *config.Config) string {
+	if c == nil {
+		return ""
+	}
+	want := c.DefaultDestination
+	for _, d := range c.Destinations {
+		if d.Type != "webhookscout" {
+			continue
+		}
+		if want == "" || d.Name == want {
+			return d.AgentID
+		}
+	}
+	return ""
 }
 
 type claudeToolHookPayload struct {
@@ -971,7 +1047,7 @@ func flushQueueOnce(ctx context.Context, g *Globals, c *config.Config, q *queue.
 	if err := enforceFirstSendApproval(g, c, false); err != nil {
 		return err
 	}
-	reg, err := buildRegistry(c, newResolver(g))
+	reg, err := buildRegistry(c, newResolver(g), newHaltCache(g))
 	if err != nil {
 		return err
 	}
@@ -1025,8 +1101,22 @@ func claudeHookSnippet(g *Globals, args []string) int {
 	}
 	postCmd := claudeHookCommand(g, "post-tool-use", *flush, *dest)
 	stopCmd := claudeHookCommand(g, "stop", *flush, *dest)
+	preCmd := claudeHookCommand(g, "pre-tool-use", false, *dest)
 	snippet := map[string]any{
 		"hooks": map[string]any{
+			// PreToolUse fires before each tool call. ScoutTrace's pre-
+			// tool-use subcommand prints `decision: block` when the
+			// agent is halted by a WebhookScout cost gate, otherwise
+			// stays silent. This is what closes the cost-gate loop for
+			// Claude Code users.
+			"PreToolUse": []any{
+				map[string]any{
+					"matcher": "*",
+					"hooks": []any{
+						map[string]any{"type": "command", "command": preCmd},
+					},
+				},
+			},
 			"PostToolUse": []any{
 				map[string]any{
 					"matcher": "*",
@@ -1065,6 +1155,11 @@ func claudeHookInstall(g *Globals, args []string) int {
 	}
 	postCmd := claudeHookCommand(g, "post-tool-use", *flush, *dest)
 	stopCmd := claudeHookCommand(g, "stop", *flush, *dest)
+	preCmd := claudeHookCommand(g, "pre-tool-use", false, *dest)
+	if err := appendClaudeHook(settingsPath, "PreToolUse", preCmd, true); err != nil {
+		fmt.Fprintln(g.Stderr, "claude-hook install:", err)
+		return 1
+	}
 	if err := appendClaudeHook(settingsPath, "PostToolUse", postCmd, true); err != nil {
 		fmt.Fprintln(g.Stderr, "claude-hook install:", err)
 		return 1
@@ -1073,7 +1168,7 @@ func claudeHookInstall(g *Globals, args []string) int {
 		fmt.Fprintln(g.Stderr, "claude-hook install:", err)
 		return 1
 	}
-	fmt.Fprintf(g.Stdout, "Installed Claude Code PostToolUse and Stop hooks in %s\n", settingsPath)
+	fmt.Fprintf(g.Stdout, "Installed Claude Code PreToolUse, PostToolUse, and Stop hooks in %s\n", settingsPath)
 	fmt.Fprintln(g.Stdout, "Restart Claude Code or reopen the project for hook settings to take effect.")
 	return 0
 }
